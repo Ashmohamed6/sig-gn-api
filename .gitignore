@@ -18,6 +18,8 @@ dumps/
 *.dump
 *.backup
 *.sql
+tmp_core_inspect.py
+nul
 
 # OS / IDE
 .vscode/

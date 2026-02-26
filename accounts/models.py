@@ -1,4 +1,4 @@
-from django.contrib.auth.models import AbstractUser
+﻿from django.contrib.auth.models import AbstractUser
 from django.db import models
 
 
@@ -13,8 +13,8 @@ class RefRegion(models.Model):
     class Meta:
         managed = False
         db_table = 'ref"."admin_region'
-        verbose_name = "région (référentiel)"
-        verbose_name_plural = "régions (référentiel)"
+        verbose_name = "region (referentiel)"
+        verbose_name_plural = "regions (referentiel)"
 
     def __str__(self) -> str:
         return self.nom or self.id_region
@@ -37,8 +37,8 @@ class RefProject(models.Model):
     class Meta:
         managed = False
         db_table = 'ref"."projet'
-        verbose_name = "projet (référentiel)"
-        verbose_name_plural = "projets (référentiel)"
+        verbose_name = "projet (referentiel)"
+        verbose_name_plural = "projets (referentiel)"
 
     def __str__(self) -> str:
         return self.libelle_public or self.code_fonc or str(self.project_id)
@@ -46,8 +46,9 @@ class RefProject(models.Model):
 
 class UserRole(models.TextChoices):
     READER = "reader", "Lecteur"
-    EDITOR = "editor", "Éditeur / Analyste"
-    MANAGER = "manager", "Chef de projet"
+    EDITOR = "editor", "\u00c9diteur / Analyste"
+    MANAGER = "manager", "Chef d'\u00e9quipe (Admin niveau 1)"
+    PROJECT_MANAGER = "project_manager", "Chef de projet (Admin niveau 2)"
     ADMIN = "admin", "Admin"
 
 
@@ -58,7 +59,7 @@ class User(AbstractUser):
         default=UserRole.READER,
     )
 
-    # Région d’affectation (Kindia / Mamou)
+    # Region d'affectation (Kindia / Mamou)
     region = models.ForeignKey(
         RefRegion,
         on_delete=models.SET_NULL,
@@ -66,17 +67,17 @@ class User(AbstractUser):
         blank=True,
         db_column="region_id",
         related_name="users",
-        help_text="Région à laquelle l'utilisateur est rattaché.",
+        help_text="Region a laquelle l'utilisateur est rattache.",
     )
 
-    # Projet actif par défaut
+    # Projet actif par defaut
     default_project = models.ForeignKey(
         RefProject,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
         related_name="default_users",
-        help_text="Projet actif par défaut après connexion.",
+        help_text="Projet actif par defaut apres connexion.",
     )
 
     # Projets accessibles
@@ -84,14 +85,12 @@ class User(AbstractUser):
         RefProject,
         related_name="users",
         blank=True,
-        help_text="Projets du référentiel ref.projet auxquels l'utilisateur a accès.",
+        help_text="Projets du referentiel ref.projet auxquels l'utilisateur a acces.",
     )
 
-
-    # ✅ AJOUTEZ CES 2 LIGNES
-    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Date de création")
-    updated_at = models.DateTimeField(auto_now=True, verbose_name="Dernière modification")
-
+    # Champs de tracabilite
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Date de creation")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="Derniere modification")
 
     class Meta:
         verbose_name = "utilisateur"

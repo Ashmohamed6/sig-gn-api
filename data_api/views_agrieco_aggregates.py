@@ -12,34 +12,27 @@ from rest_framework.response import Response
 
 from .mixins import CurrentProjectRequiredMixin
 
-# Import UserRole depuis accounts
-try:
-    from accounts.models import UserRole
-except ImportError:
-    class UserRole:
-        ADMIN = "admin"
-
 
 def get_user_region_filter(user):
     """
     Retourne la clause SQL et les params pour filtrer par régions de l'utilisateur.
-    Les admins (superuser ou role=admin) voient tout.
+    Les admins techniques (superuser/staff) voient tout.
     """
-    if user.is_superuser:
+    role = str(getattr(user, "role", "") or "").strip().lower()
+    if user.is_superuser or getattr(user, "is_staff", False) or role in {"admin", "project_manager"}:
         return "", []
-    
-    role = getattr(user, "role", None)
-    is_admin = role == UserRole.ADMIN if hasattr(UserRole, 'ADMIN') else str(role).lower() == 'admin'
-    
-    if is_admin:
-        return "", []
-    
-    if hasattr(user, 'regions'):
+
+    if hasattr(user, "regions"):
         region_ids = list(user.regions.values_list("id_region", flat=True))
         if region_ids:
             return "AND id_region = ANY(%s)", [region_ids]
-    
-    return "", []
+
+    region_id = getattr(user, "region_id", None)
+    if region_id:
+        return "AND id_region = %s", [region_id]
+
+    # Fail closed: un user non-admin sans région n'obtient aucune donnée.
+    return "AND 1 = 0", []
 
 
 class AgrMenageAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):

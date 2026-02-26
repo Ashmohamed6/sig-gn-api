@@ -1,28 +1,153 @@
 from django.db import connection
 
+from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.generics import GenericAPIView
+from rest_framework.exceptions import PermissionDenied
 
 from .mixins import CurrentProjectRequiredMixin
 from .pagination import StandardResultsSetPagination
 from .serializers import PingSerializer
 from accounts.serializers import RefProjectSerializer
+from accounts.models import UserRole
+
+DATA_EDIT_ALLOWED_ROLES = {
+    UserRole.MANAGER,
+    UserRole.PROJECT_MANAGER,
+    UserRole.ADMIN,
+}
+
+DATA_PURGE_ALLOWED_ROLES = {
+    UserRole.PROJECT_MANAGER,
+    UserRole.ADMIN,
+}
+
+DATA_ENTITY_EDIT_CONFIG = {
+    "cep": {"schema": "core", "table": "cep_parcelle", "id_fields": {"id_cep", "cep_uuid"}, "scope": "self"},
+    "intrants": {"schema": "core", "table": "intrant_distribution", "id_fields": {"intrant_uuid"}, "scope": "self"},
+    "ouvrages": {"schema": "core", "table": "ouvrage", "id_fields": {"ouvrage_uuid", "code_ouvrage"}, "scope": "self"},
+    "zones_degradees": {"schema": "core", "table": "zone_degradee", "id_fields": {"zone_uuid", "id_zone"}, "scope": "self"},
+    "tetes_sources": {"schema": "core", "table": "tete_source", "id_fields": {"ts_uuid", "id_ts"}, "scope": "self"},
+    "couloirs": {"schema": "core", "table": "couloir", "id_fields": {"id_couloir"}, "scope": "self"},
+    "organisations": {"schema": "core", "table": "agr_organisation", "id_fields": {"id_org", "org_uuid"}, "scope": "self"},
+    "menages": {"schema": "core", "table": "agr_menage", "id_fields": {"id_menage", "menage_uuid"}, "scope": "self"},
+    "comites": {"schema": "core", "table": "agr_comite", "id_fields": {"id_comite", "comite_uuid"}, "scope": "self"},
+    "stations_meteo": {"schema": "core", "table": "meteo_station", "id_fields": {"station_uuid", "code_station"}, "scope": "self"},
+    "marches": {"schema": "core", "table": "marche", "id_fields": {"marche_uuid", "id_marche"}, "scope": "self"},
+    "formations": {"schema": "core", "table": "formation_eco", "id_fields": {"formation_uuid", "id_formation"}, "scope": "self"},
+    "entreprises": {"schema": "core", "table": "entreprise_econ", "id_fields": {"ent_uuid", "id_ent"}, "scope": "self"},
+    "sortants": {"schema": "core", "table": "fiere_suivi_sortant", "id_fields": {"suivi_uuid", "id_sortant"}, "scope": "self"},
+    "emplois": {"schema": "core", "table": "ent_emploi_dom", "id_fields": {"emploi_dom_uuid"}, "scope": "emploi_parent"},
+    "insertions": {"schema": "core", "table": "ent_insertion_dom", "id_fields": {"insertion_dom_uuid"}, "scope": "insertion_parent"},
+}
+
+DATA_ENTITY_PROTECTED_COLUMNS = {
+    "created_at",
+    "updated_at",
+    "valid_from",
+    "valid_to",
+    "record_source",
+    "raw_uuid",
+    "project_code",
+    "id_region",
+    "id_prefecture",
+    "id_commune",
+    "geom",
+    "geom_point",
+    "geom_zone",
+}
+
+
+def is_global_admin(user) -> bool:
+    role = str(getattr(user, "role", "") or "").strip().lower()
+    return bool(
+        user
+        and user.is_authenticated
+        and (user.is_superuser or user.is_staff or role == UserRole.ADMIN)
+    )
+
+
+def is_project_admin(user) -> bool:
+    role = str(getattr(user, "role", "") or "").strip().lower()
+    return bool(
+        user
+        and user.is_authenticated
+        and (user.is_superuser or user.is_staff or role in {UserRole.ADMIN, UserRole.PROJECT_MANAGER})
+    )
+
+
+def get_user_region_ids(user):
+    if is_project_admin(user):
+        return []
+
+    if hasattr(user, "regions"):
+        ids = [rid for rid in user.regions.values_list("id_region", flat=True) if rid]
+        if ids:
+            return ids
+
+    region_id = getattr(user, "region_id", None)
+    if region_id:
+        return [region_id]
+
+    # Fail closed: aucun scope rÃ©gional => aucune donnÃ©e
+    return ["__NO_REGION__"]
+
+
+def build_access_scope_for_project(request, project_code: str):
+    """
+    Portee d'acces serveur (projet + region):
+    - admin plateforme: acces global
+    - non-admin: region imposee (fail-closed)
+    """
+    where_clauses = ["project_code = %s"]
+    params: list = [project_code]
+
+    user = request.user
+    if is_project_admin(user):
+        return where_clauses, params
+
+    region_ids = get_user_region_ids(user)
+    if region_ids:
+        where_clauses.append("id_region = ANY(%s)")
+        params.append(region_ids)
+
+    requested_region = str(request.query_params.get("region_id", "") or "").strip()
+    if requested_region and requested_region not in region_ids:
+        raise PermissionDenied("Acces refuse: region hors perimetre de votre compte.")
+
+    return where_clauses, params
+
+
+def sql_true(column: str) -> str:
+    """
+    Expression SQL robuste pour interprÃ©ter un boolÃ©en, que la colonne soit
+    de type BOOLEAN ou TEXT ('oui'/'true'/etc.).
+    """
+    return (
+        f"LOWER(COALESCE({column}::text, '')) IN "
+        "('true','t','1','yes','y','oui','vrai')"
+    )
+
+
+def sql_bool(column: str, expected: bool) -> str:
+    expr = sql_true(column)
+    return expr if expected else f"NOT ({expr})"
 
 
 def filter_by_access(queryset, user):
     """
     Restreint un queryset en fonction :
-      - des projets associés à l'utilisateur (RefProject via code_kobo),
-      - des régions associées (Region via id_region).
+      - des projets associÃ©s Ã  l'utilisateur (RefProject via code_kobo),
+      - des rÃ©gions associÃ©es (Region via id_region).
 
     Les admins (superuser ou role=admin) voient tout.
     """
     if not user.is_authenticated:
         return queryset.none()
 
-    if user.is_superuser or getattr(user, "role", None) == UserRole.ADMIN:
+    if is_global_admin(user):
         return queryset
 
     # Filtre par projets (ref.projet.code_kobo)
@@ -31,11 +156,11 @@ def filter_by_access(queryset, user):
     )
     if project_codes:
         queryset = queryset.filter(project_code__in=project_codes)
+    else:
+        return queryset.none()
 
-    # Filtre par régions (ref.admin_region.id_region)
-    region_ids = list(
-        user.regions.values_list("id_region", flat=True)
-    )
+    # Filtre par rÃ©gions (ref.admin_region.id_region)
+    region_ids = get_user_region_ids(user)
     if region_ids:
         queryset = queryset.filter(id_region__in=region_ids)
 
@@ -66,15 +191,684 @@ class PingView(GenericAPIView):
 
 
 
+class DataEntityUpdateView(CurrentProjectRequiredMixin, GenericAPIView):
+    """
+    Edition controlee des donnees metier (core.*) depuis le module Donnees.
+    - autorise uniquement admin N1/N2/global (manager, project_manager, admin)
+    - scope projet obligatoire + scope region pour profils non project-admin
+    """
+
+    permission_classes = [IsAuthenticated]
+    throttle_scope = "admin_write"
+
+    @staticmethod
+    def _quote_ident(identifier: str) -> str:
+        return '"' + str(identifier).replace('"', '""') + '"'
+
+    def _can_edit(self, user) -> bool:
+        role = str(getattr(user, "role", "") or "").strip().lower()
+        return bool(
+            user
+            and user.is_authenticated
+            and (user.is_superuser or user.is_staff or role in DATA_EDIT_ALLOWED_ROLES)
+        )
+
+    def _get_table_columns(self, schema: str, table: str) -> set[str]:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                  AND table_name = %s
+                """,
+                [schema, table],
+            )
+            rows = cursor.fetchall()
+        return {str(r[0]) for r in rows if r and r[0]}
+
+    def _build_update_sql(self, cfg: dict, id_field: str, filtered_changes: dict, project_code: str, user):
+        schema = cfg["schema"]
+        table = cfg["table"]
+        scope = cfg.get("scope", "self")
+        columns = self._get_table_columns(schema, table)
+
+        if id_field not in columns:
+            return None, None, f"Champ identifiant '{id_field}' absent de {schema}.{table}."
+
+        set_clauses = []
+        params: list = []
+        for key, value in filtered_changes.items():
+            set_clauses.append(f"{self._quote_ident(key)} = %s")
+            params.append(value)
+
+        if "updated_at" in columns:
+            set_clauses.append('"updated_at" = NOW()')
+
+        if not set_clauses:
+            return None, None, "Aucune colonne modifiable detectee dans la requete."
+
+        where_clauses = [f"t.{self._quote_ident(id_field)} = %s"]
+        from_clause = ""
+
+        if scope == "self":
+            if "project_code" in columns:
+                where_clauses.append('t."project_code" = %s')
+                params.append(project_code)
+            else:
+                return None, None, f"Table cible {schema}.{table} sans colonne project_code."
+
+            if not is_project_admin(user) and "id_region" in columns:
+                region_ids = get_user_region_ids(user)
+                where_clauses.append('t."id_region" = ANY(%s)')
+                params.append(region_ids)
+
+        elif scope == "emploi_parent":
+            from_clause = ' FROM "core"."ent_emploi" AS p'
+            where_clauses.append('p."emploi_uuid" = t."emploi_uuid"')
+            where_clauses.append('p."project_code" = %s')
+            params.append(project_code)
+
+            if not is_project_admin(user):
+                region_ids = get_user_region_ids(user)
+                where_clauses.append('p."id_region" = ANY(%s)')
+                params.append(region_ids)
+
+        elif scope == "insertion_parent":
+            from_clause = ' FROM "core"."ent_insertion" AS p'
+            where_clauses.append('p."insertion_uuid" = t."insertion_uuid"')
+            where_clauses.append('p."project_code" = %s')
+            params.append(project_code)
+
+            if not is_project_admin(user):
+                region_ids = get_user_region_ids(user)
+                where_clauses.append('p."id_region" = ANY(%s)')
+                params.append(region_ids)
+
+        else:
+            return None, None, f"Scope d'edition non supporte: {scope}."
+
+        target_table = f"{self._quote_ident(schema)}.{self._quote_ident(table)}"
+        sql = (
+            f"UPDATE {target_table} AS t "
+            f"SET {', '.join(set_clauses)}"
+            f"{from_clause} "
+            f"WHERE {' AND '.join(where_clauses)}"
+        )
+        return sql, params, None
+
+    def patch(self, request, table_id: str):
+        if not self._can_edit(request.user):
+            return Response(
+                {"detail": "Modification reservee aux admins N1/N2/global."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        project, error_response = self.get_current_project(request)
+        if error_response is not None:
+            return error_response
+
+        cfg = DATA_ENTITY_EDIT_CONFIG.get(str(table_id or "").strip().lower())
+        if not cfg:
+            return Response(
+                {"detail": f"Table '{table_id}' non supportee pour edition."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        payload = request.data if isinstance(request.data, dict) else {}
+        entity_id = str(payload.get("id", "") or "").strip()
+        id_field = str(payload.get("id_field", "") or "").strip()
+        changes = payload.get("changes")
+
+        if not entity_id:
+            return Response({"detail": "Champ 'id' obligatoire."}, status=status.HTTP_400_BAD_REQUEST)
+        if not id_field:
+            return Response({"detail": "Champ 'id_field' obligatoire."}, status=status.HTTP_400_BAD_REQUEST)
+        if id_field not in cfg["id_fields"]:
+            return Response(
+                {"detail": f"Identifiant '{id_field}' non autorise pour '{table_id}'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if not isinstance(changes, dict) or not changes:
+            return Response(
+                {"detail": "Champ 'changes' obligatoire (objet non vide)."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        schema = cfg["schema"]
+        table = cfg["table"]
+        table_columns = self._get_table_columns(schema, table)
+
+        filtered_changes = {}
+        ignored_fields = []
+        for key, value in changes.items():
+            field = str(key or "").strip()
+            if not field:
+                continue
+            if field in DATA_ENTITY_PROTECTED_COLUMNS:
+                ignored_fields.append(field)
+                continue
+            if field.endswith("_label") or field.endswith("_labels"):
+                ignored_fields.append(field)
+                continue
+            if field not in table_columns:
+                ignored_fields.append(field)
+                continue
+            filtered_changes[field] = value
+
+        if not filtered_changes:
+            return Response(
+                {
+                    "detail": "Aucune colonne editable n'a ete soumise.",
+                    "ignored_fields": sorted(set(ignored_fields)),
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        sql, params, sql_error = self._build_update_sql(
+            cfg=cfg,
+            id_field=id_field,
+            filtered_changes=filtered_changes,
+            project_code=project.code_fonc,
+            user=request.user,
+        )
+        if sql_error:
+            return Response({"detail": sql_error}, status=status.HTTP_400_BAD_REQUEST)
+
+        with connection.cursor() as cursor:
+            ordered_params = params[:len(filtered_changes)] + [entity_id] + params[len(filtered_changes):]
+            cursor.execute(sql, ordered_params)
+            affected = int(cursor.rowcount or 0)
+
+        if affected <= 0:
+            return Response(
+                {"detail": "Enregistrement introuvable ou hors perimetre de vos droits."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        return Response(
+            {
+                "detail": "Modification enregistree.",
+                "table": table_id,
+                "id_field": id_field,
+                "id": entity_id,
+                "updated_fields": sorted(filtered_changes.keys()),
+                "ignored_fields": sorted(set(ignored_fields)),
+                "affected_rows": affected,
+                "source_schema": f"{schema}.{table}",
+            }
+        )
+
+
+class DataEntityDeleteView(CurrentProjectRequiredMixin, GenericAPIView):
+    """
+    Suppression controlee d'une ligne metier (core.*) depuis le module Donnees.
+    - autorise N1/N2/global (manager, project_manager, admin)
+    - scope projet obligatoire + scope region pour profils non project-admin
+    """
+
+    permission_classes = [IsAuthenticated]
+    throttle_scope = "admin_write"
+
+    @staticmethod
+    def _quote_ident(identifier: str) -> str:
+        return '"' + str(identifier).replace('"', '""') + '"'
+
+    def _can_delete(self, user) -> bool:
+        role = str(getattr(user, "role", "") or "").strip().lower()
+        return bool(
+            user
+            and user.is_authenticated
+            and (user.is_superuser or user.is_staff or role in DATA_EDIT_ALLOWED_ROLES)
+        )
+
+    def _get_table_columns(self, schema: str, table: str) -> set[str]:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                  AND table_name = %s
+                """,
+                [schema, table],
+            )
+            rows = cursor.fetchall()
+        return {str(r[0]) for r in rows if r and r[0]}
+
+    def _resolve_id_field(self, cfg: dict, requested_id_field: str, table_id: str):
+        id_field = str(requested_id_field or "").strip()
+        if not id_field and len(cfg["id_fields"]) == 1:
+            id_field = next(iter(cfg["id_fields"]))
+
+        if not id_field:
+            return None, Response(
+                {"detail": "Champ 'id_field' obligatoire."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if id_field not in cfg["id_fields"]:
+            return None, Response(
+                {"detail": f"Identifiant '{id_field}' non autorise pour '{table_id}'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return id_field, None
+
+    def _build_delete_sql(self, cfg: dict, id_field: str, project_code: str, user):
+        schema = cfg["schema"]
+        table = cfg["table"]
+        scope = cfg.get("scope", "self")
+        columns = self._get_table_columns(schema, table)
+
+        if id_field not in columns:
+            return None, None, f"Champ identifiant '{id_field}' absent de {schema}.{table}."
+
+        where_clauses = [f"t.{self._quote_ident(id_field)}::text = %s"]
+        params: list = []
+        from_clause = ""
+
+        if scope == "self":
+            if "project_code" not in columns:
+                return None, None, f"Table cible {schema}.{table} sans colonne project_code."
+            where_clauses.append('t."project_code" = %s')
+
+            if not is_project_admin(user) and "id_region" in columns:
+                region_ids = get_user_region_ids(user)
+                where_clauses.append('t."id_region" = ANY(%s)')
+                params.append(region_ids)
+
+        elif scope == "emploi_parent":
+            from_clause = ' USING "core"."ent_emploi" AS p'
+            where_clauses.append('p."emploi_uuid" = t."emploi_uuid"')
+            where_clauses.append('p."project_code" = %s')
+
+            if not is_project_admin(user):
+                region_ids = get_user_region_ids(user)
+                where_clauses.append('p."id_region" = ANY(%s)')
+                params.append(region_ids)
+
+        elif scope == "insertion_parent":
+            from_clause = ' USING "core"."ent_insertion" AS p'
+            where_clauses.append('p."insertion_uuid" = t."insertion_uuid"')
+            where_clauses.append('p."project_code" = %s')
+
+            if not is_project_admin(user):
+                region_ids = get_user_region_ids(user)
+                where_clauses.append('p."id_region" = ANY(%s)')
+                params.append(region_ids)
+
+        else:
+            return None, None, f"Scope de suppression non supporte: {scope}."
+
+        target_table = f"{self._quote_ident(schema)}.{self._quote_ident(table)}"
+        sql = f"DELETE FROM {target_table} AS t{from_clause} WHERE {' AND '.join(where_clauses)}"
+        ordered_params = [None, project_code, *params]
+        return sql, ordered_params, None
+
+    def delete(self, request, table_id: str, record_id: str):
+        if not self._can_delete(request.user):
+            return Response(
+                {"detail": "Suppression reservee aux admins N1/N2/global."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        project, error_response = self.get_current_project(request)
+        if error_response is not None:
+            return error_response
+
+        cfg = DATA_ENTITY_EDIT_CONFIG.get(str(table_id or "").strip().lower())
+        if not cfg:
+            return Response(
+                {"detail": f"Table '{table_id}' non supportee pour suppression."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        id_field, id_error = self._resolve_id_field(cfg, request.query_params.get("id_field", ""), table_id)
+        if id_error is not None:
+            return id_error
+
+        entity_id = str(record_id or "").strip()
+        if not entity_id:
+            return Response({"detail": "Identifiant vide."}, status=status.HTTP_400_BAD_REQUEST)
+
+        sql, template_params, sql_error = self._build_delete_sql(
+            cfg=cfg,
+            id_field=id_field,
+            project_code=project.code_fonc,
+            user=request.user,
+        )
+        if sql_error:
+            return Response({"detail": sql_error}, status=status.HTTP_400_BAD_REQUEST)
+
+        params = template_params[:]
+        params[0] = entity_id
+
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params)
+            affected = int(cursor.rowcount or 0)
+
+        if affected <= 0:
+            return Response(
+                {"detail": "Enregistrement introuvable ou hors perimetre de vos droits."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        return Response(
+            {
+                "detail": "Suppression enregistree.",
+                "table": table_id,
+                "id_field": id_field,
+                "id": entity_id,
+                "deleted_count": affected,
+            }
+        )
+
+
+class DataEntityBulkDeleteView(CurrentProjectRequiredMixin, GenericAPIView):
+    """
+    Suppression en lot de lignes metier (core.*) depuis le module Donnees.
+    - autorise N1/N2/global (manager, project_manager, admin)
+    - scope projet obligatoire + scope region pour profils non project-admin
+    """
+
+    permission_classes = [IsAuthenticated]
+    throttle_scope = "admin_write"
+    max_bulk_delete_ids = 20000
+
+    @staticmethod
+    def _quote_ident(identifier: str) -> str:
+        return '"' + str(identifier).replace('"', '""') + '"'
+
+    def _can_delete(self, user) -> bool:
+        role = str(getattr(user, "role", "") or "").strip().lower()
+        return bool(
+            user
+            and user.is_authenticated
+            and (user.is_superuser or user.is_staff or role in DATA_EDIT_ALLOWED_ROLES)
+        )
+
+    def _get_table_columns(self, schema: str, table: str) -> set[str]:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                  AND table_name = %s
+                """,
+                [schema, table],
+            )
+            rows = cursor.fetchall()
+        return {str(r[0]) for r in rows if r and r[0]}
+
+    def _resolve_id_field(self, cfg: dict, requested_id_field: str, table_id: str):
+        id_field = str(requested_id_field or "").strip()
+        if not id_field and len(cfg["id_fields"]) == 1:
+            id_field = next(iter(cfg["id_fields"]))
+
+        if not id_field:
+            return None, Response(
+                {"detail": "Champ 'id_field' obligatoire."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if id_field not in cfg["id_fields"]:
+            return None, Response(
+                {"detail": f"Identifiant '{id_field}' non autorise pour '{table_id}'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return id_field, None
+
+    def _normalize_ids(self, raw_ids):
+        if not isinstance(raw_ids, list):
+            return None, Response(
+                {"detail": "Champ 'ids' obligatoire (liste non vide)."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        seen: set[str] = set()
+        cleaned: list[str] = []
+        for raw in raw_ids:
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            if text in seen:
+                continue
+            seen.add(text)
+            cleaned.append(text)
+
+        if not cleaned:
+            return None, Response(
+                {"detail": "Champ 'ids' obligatoire (liste non vide)."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if len(cleaned) > self.max_bulk_delete_ids:
+            return None, Response(
+                {"detail": f"Trop d'identifiants. Maximum autorise: {self.max_bulk_delete_ids}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return cleaned, None
+
+    def _build_bulk_delete_sql(self, cfg: dict, id_field: str, project_code: str, user):
+        schema = cfg["schema"]
+        table = cfg["table"]
+        scope = cfg.get("scope", "self")
+        columns = self._get_table_columns(schema, table)
+
+        if id_field not in columns:
+            return None, None, f"Champ identifiant '{id_field}' absent de {schema}.{table}."
+
+        where_clauses = [f"t.{self._quote_ident(id_field)}::text = ANY(%s)"]
+        params: list = []
+        from_clause = ""
+
+        if scope == "self":
+            if "project_code" not in columns:
+                return None, None, f"Table cible {schema}.{table} sans colonne project_code."
+            where_clauses.append('t."project_code" = %s')
+
+            if not is_project_admin(user) and "id_region" in columns:
+                region_ids = get_user_region_ids(user)
+                where_clauses.append('t."id_region" = ANY(%s)')
+                params.append(region_ids)
+
+        elif scope == "emploi_parent":
+            from_clause = ' USING "core"."ent_emploi" AS p'
+            where_clauses.append('p."emploi_uuid" = t."emploi_uuid"')
+            where_clauses.append('p."project_code" = %s')
+
+            if not is_project_admin(user):
+                region_ids = get_user_region_ids(user)
+                where_clauses.append('p."id_region" = ANY(%s)')
+                params.append(region_ids)
+
+        elif scope == "insertion_parent":
+            from_clause = ' USING "core"."ent_insertion" AS p'
+            where_clauses.append('p."insertion_uuid" = t."insertion_uuid"')
+            where_clauses.append('p."project_code" = %s')
+
+            if not is_project_admin(user):
+                region_ids = get_user_region_ids(user)
+                where_clauses.append('p."id_region" = ANY(%s)')
+                params.append(region_ids)
+
+        else:
+            return None, None, f"Scope de suppression non supporte: {scope}."
+
+        target_table = f"{self._quote_ident(schema)}.{self._quote_ident(table)}"
+        sql = f"DELETE FROM {target_table} AS t{from_clause} WHERE {' AND '.join(where_clauses)}"
+        ordered_params = [None, project_code, *params]
+        return sql, ordered_params, None
+
+    def post(self, request, table_id: str):
+        if not self._can_delete(request.user):
+            return Response(
+                {"detail": "Suppression reservee aux admins N1/N2/global."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        project, error_response = self.get_current_project(request)
+        if error_response is not None:
+            return error_response
+
+        cfg = DATA_ENTITY_EDIT_CONFIG.get(str(table_id or "").strip().lower())
+        if not cfg:
+            return Response(
+                {"detail": f"Table '{table_id}' non supportee pour suppression."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        payload = request.data if isinstance(request.data, dict) else {}
+        id_field, id_error = self._resolve_id_field(cfg, payload.get("id_field", ""), table_id)
+        if id_error is not None:
+            return id_error
+
+        ids, ids_error = self._normalize_ids(payload.get("ids"))
+        if ids_error is not None:
+            return ids_error
+
+        sql, template_params, sql_error = self._build_bulk_delete_sql(
+            cfg=cfg,
+            id_field=id_field,
+            project_code=project.code_fonc,
+            user=request.user,
+        )
+        if sql_error:
+            return Response({"detail": sql_error}, status=status.HTTP_400_BAD_REQUEST)
+
+        params = template_params[:]
+        params[0] = ids
+
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params)
+            affected = int(cursor.rowcount or 0)
+
+        return Response(
+            {
+                "detail": "Suppression en lot terminee.",
+                "table": table_id,
+                "id_field": id_field,
+                "requested_count": len(ids),
+                "deleted_count": affected,
+            }
+        )
+
+
+class DataEntityPurgeView(CurrentProjectRequiredMixin, GenericAPIView):
+    """
+    Purge d'une table metier (core.*) pour le projet actif.
+    - reserve N2/global (project_manager, admin)
+    """
+
+    permission_classes = [IsAuthenticated]
+    throttle_scope = "admin_write"
+
+    @staticmethod
+    def _quote_ident(identifier: str) -> str:
+        return '"' + str(identifier).replace('"', '""') + '"'
+
+    def _can_purge(self, user) -> bool:
+        role = str(getattr(user, "role", "") or "").strip().lower()
+        return bool(
+            user
+            and user.is_authenticated
+            and (user.is_superuser or user.is_staff or role in DATA_PURGE_ALLOWED_ROLES)
+        )
+
+    def _get_table_columns(self, schema: str, table: str) -> set[str]:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = %s
+                  AND table_name = %s
+                """,
+                [schema, table],
+            )
+            rows = cursor.fetchall()
+        return {str(r[0]) for r in rows if r and r[0]}
+
+    def _build_purge_sql(self, cfg: dict, project_code: str):
+        schema = cfg["schema"]
+        table = cfg["table"]
+        scope = cfg.get("scope", "self")
+        columns = self._get_table_columns(schema, table)
+
+        where_clauses = []
+        params: list = [project_code]
+        from_clause = ""
+
+        if scope == "self":
+            if "project_code" not in columns:
+                return None, None, f"Table cible {schema}.{table} sans colonne project_code."
+            where_clauses.append('t."project_code" = %s')
+
+        elif scope == "emploi_parent":
+            from_clause = ' USING "core"."ent_emploi" AS p'
+            where_clauses.append('p."emploi_uuid" = t."emploi_uuid"')
+            where_clauses.append('p."project_code" = %s')
+
+        elif scope == "insertion_parent":
+            from_clause = ' USING "core"."ent_insertion" AS p'
+            where_clauses.append('p."insertion_uuid" = t."insertion_uuid"')
+            where_clauses.append('p."project_code" = %s')
+
+        else:
+            return None, None, f"Scope de purge non supporte: {scope}."
+
+        target_table = f"{self._quote_ident(schema)}.{self._quote_ident(table)}"
+        sql = f"DELETE FROM {target_table} AS t{from_clause} WHERE {' AND '.join(where_clauses)}"
+        return sql, params, None
+
+    def post(self, request, table_id: str):
+        if not self._can_purge(request.user):
+            return Response(
+                {"detail": "Purge reservee aux admins N2/global."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        project, error_response = self.get_current_project(request)
+        if error_response is not None:
+            return error_response
+
+        cfg = DATA_ENTITY_EDIT_CONFIG.get(str(table_id or "").strip().lower())
+        if not cfg:
+            return Response(
+                {"detail": f"Table '{table_id}' non supportee pour purge."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        sql, params, sql_error = self._build_purge_sql(cfg=cfg, project_code=project.code_fonc)
+        if sql_error:
+            return Response({"detail": sql_error}, status=status.HTTP_400_BAD_REQUEST)
+
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params)
+            affected = int(cursor.rowcount or 0)
+
+        return Response(
+            {
+                "detail": "Purge terminee pour le projet actif.",
+                "table": table_id,
+                "project_code": project.code_fonc,
+                "purged_count": affected,
+            }
+        )
+
 # -----------------------------------------------------------------------------
 # Liste des Entreprises
 # -----------------------------------------------------------------------------
 
 class EntrepriseListView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Liste les entreprises économiques depuis la vue marts.vw_entreprise_econ,
-    filtrées par projet actif via project_code (FIERE / AGRIECO)
-    ET par région(s) autorisée(s) pour l'utilisateur connecté.
+    Liste les entreprises Ã©conomiques depuis la vue marts.vw_entreprise_econ,
+    filtrÃ©es par projet actif via project_code (FIERE / AGRIECO)
+    ET par rÃ©gion(s) autorisÃ©e(s) pour l'utilisateur connectÃ©.
 
     Filtres possibles en query string :
 
@@ -88,9 +882,9 @@ class EntrepriseListView(CurrentProjectRequiredMixin, GenericAPIView):
     - ?marche_principal=...          (code ref.marche_principal)
     - ?enregistre_formel=oui|non
     - ?est_mpme_formalisee=true|false
-    - ?est_mpme_appuyee=true|false   (utilise le champ booléen est_mpme_appuyee_fiere)
+    - ?est_mpme_appuyee=true|false   (utilise le champ boolÃ©en est_mpme_appuyee_fiere)
     - ?id_ent=...
-    - ?has_geom=true|false           (présence de géométrie)
+    - ?has_geom=true|false           (prÃ©sence de gÃ©omÃ©trie)
     """
 
     permission_classes = [IsAuthenticated]
@@ -105,7 +899,7 @@ class EntrepriseListView(CurrentProjectRequiredMixin, GenericAPIView):
         # Ici on suppose que project_code dans les vues marts = code_fonc du projet
         project_code = project.code_fonc
 
-        # -------- Filtres venant de la requête --------
+        # -------- Filtres venant de la requÃªte --------
         region_id = request.query_params.get("region_id")
         prefecture_id = request.query_params.get("prefecture_id")
         commune_id = request.query_params.get("commune_id")
@@ -124,19 +918,7 @@ class EntrepriseListView(CurrentProjectRequiredMixin, GenericAPIView):
         search = request.query_params.get("search")
 
         # -------- Construction du WHERE SQL --------
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
-
-        user = request.user
-
-        # Restriction automatique par région(s) pour les non-admins
-        # (Mamou / Kindia, etc.)
-        if not (user.is_superuser or getattr(user, "role", None) == UserRole.ADMIN):
-            region_ids = list(user.regions.values_list("id_region", flat=True))
-            if region_ids:
-                # id_region = ANY(ARRAY[...])
-                where_clauses.append("id_region = ANY(%s)")
-                params.append(region_ids)
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # --- Filtres territoriaux explicites (on intersecte avec les droits de l'utilisateur) ---
         if region_id:
@@ -151,7 +933,7 @@ class EntrepriseListView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # --- Caractéristiques de l’entreprise ---
+        # --- CaractÃ©ristiques de lâ€™entreprise ---
         if secteur_principal:
             where_clauses.append("secteur_principal = %s")
             params.append(secteur_principal)
@@ -169,14 +951,12 @@ class EntrepriseListView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("enregistre_formel = %s")
             params.append(enregistre_formel)
 
-        # --- Booléens dérivés ---
+        # --- BoolÃ©ens dÃ©rivÃ©s ---
         if est_mpme_formalisee in ("true", "false"):
-            where_clauses.append("est_mpme_formalisee = %s")
-            params.append(est_mpme_formalisee == "true")
+            where_clauses.append(sql_bool("est_mpme_formalisee", est_mpme_formalisee == "true"))
 
         if est_mpme_appuyee in ("true", "false"):
-            where_clauses.append("est_mpme_appuyee_fiere = %s")
-            params.append(est_mpme_appuyee == "true")
+            where_clauses.append(sql_bool("est_mpme_appuyee_fiere", est_mpme_appuyee == "true"))
 
         if id_ent:
             where_clauses.append("id_ent = %s")
@@ -228,7 +1008,7 @@ class EntrepriseListView(CurrentProjectRequiredMixin, GenericAPIView):
         offset = (page - 1) * page_size
         limit = page_size
 
-        # -------- Requêtes SQL --------
+        # -------- RequÃªtes SQL --------
         with connection.cursor() as cursor:
             # 1) Total
             cursor.execute(
@@ -241,7 +1021,7 @@ class EntrepriseListView(CurrentProjectRequiredMixin, GenericAPIView):
             )
             total = cursor.fetchone()[0]
 
-            # 2) Lignes paginées
+            # 2) Lignes paginÃ©es
             cursor.execute(
                 f"""
                 SELECT *
@@ -278,14 +1058,14 @@ class EntrepriseListView(CurrentProjectRequiredMixin, GenericAPIView):
 
 class EntrepriseAggregationView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Vue d'agrégation pour les entreprises économiques (marts.vw_entreprise_econ).
+    Vue d'agrÃ©gation pour les entreprises Ã©conomiques (marts.vw_entreprise_econ).
 
-    Renvoie des indicateurs globaux (pour le tableau de bord), filtrés par :
+    Renvoie des indicateurs globaux (pour le tableau de bord), filtrÃ©s par :
     - projet actif (FIERE / AGRIECO),
-    - région(s) de l'utilisateur (Mamou / Kindia),
-    - les mêmes filtres que la liste (region_id, secteur, etc.).
+    - rÃ©gion(s) de l'utilisateur (Mamou / Kindia),
+    - les mÃªmes filtres que la liste (region_id, secteur, etc.).
 
-    Exemple de réponse :
+    Exemple de rÃ©ponse :
     {
       "total_entreprises": 123,
       "total_mpme_formalisees": 45,
@@ -303,7 +1083,7 @@ class EntrepriseAggregationView(CurrentProjectRequiredMixin, GenericAPIView):
 
         project_code = project.code_fonc
 
-        # -------- Filtres de la requête --------
+        # -------- Filtres de la requÃªte --------
         region_id = request.query_params.get("region_id")
         prefecture_id = request.query_params.get("prefecture_id")
         commune_id = request.query_params.get("commune_id")
@@ -322,17 +1102,7 @@ class EntrepriseAggregationView(CurrentProjectRequiredMixin, GenericAPIView):
         search = request.query_params.get("search")
 
         # -------- WHERE SQL de base --------
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
-
-        user = request.user
-
-        # Restriction automatique par région(s) pour les non-admins
-        if not (user.is_superuser or getattr(user, "role", None) == UserRole.ADMIN):
-            region_ids = list(user.regions.values_list("id_region", flat=True))
-            if region_ids:
-                where_clauses.append("id_region = ANY(%s)")
-                params.append(region_ids)
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # --- Filtres territoriaux ---
         if region_id:
@@ -347,7 +1117,7 @@ class EntrepriseAggregationView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # --- Caractéristiques entreprise ---
+        # --- CaractÃ©ristiques entreprise ---
         if secteur_principal:
             where_clauses.append("secteur_principal = %s")
             params.append(secteur_principal)
@@ -364,14 +1134,12 @@ class EntrepriseAggregationView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("enregistre_formel = %s")
             params.append(enregistre_formel)
 
-        # --- Booléens dérivés ---
+        # --- BoolÃ©ens dÃ©rivÃ©s ---
         if est_mpme_formalisee in ("true", "false"):
-            where_clauses.append("est_mpme_formalisee = %s")
-            params.append(est_mpme_formalisee == "true")
+            where_clauses.append(sql_bool("est_mpme_formalisee", est_mpme_formalisee == "true"))
 
         if est_mpme_appuyee in ("true", "false"):
-            where_clauses.append("est_mpme_appuyee_fiere = %s")
-            params.append(est_mpme_appuyee == "true")
+            where_clauses.append(sql_bool("est_mpme_appuyee_fiere", est_mpme_appuyee == "true"))
 
         if id_ent:
             where_clauses.append("id_ent = %s")
@@ -399,15 +1167,15 @@ class EntrepriseAggregationView(CurrentProjectRequiredMixin, GenericAPIView):
 
         where_sql = " AND ".join(where_clauses)
 
-        # -------- Requête d'agrégation --------
+        # -------- RequÃªte d'agrÃ©gation --------
         with connection.cursor() as cursor:
             cursor.execute(
                 f"""
                 SELECT
                     COUNT(*) AS total_entreprises,
-                    COUNT(*) FILTER (WHERE est_mpme_formalisee = TRUE)
+                    COUNT(*) FILTER (WHERE {sql_true("est_mpme_formalisee")})
                         AS total_mpme_formalisees,
-                    COUNT(*) FILTER (WHERE est_mpme_appuyee_fiere = TRUE)
+                    COUNT(*) FILTER (WHERE {sql_true("est_mpme_appuyee_fiere")})
                         AS total_mpme_appuyees_fiere
                 FROM marts.vw_entreprise_econ
                 WHERE {where_sql}
@@ -416,10 +1184,37 @@ class EntrepriseAggregationView(CurrentProjectRequiredMixin, GenericAPIView):
             )
             row = cursor.fetchone()
 
-        data = {
+            cursor.execute(
+                f"""
+                SELECT
+                    taille_entreprise,
+                    COUNT(*) AS nb_entreprises
+                FROM marts.vw_entreprise_econ
+                WHERE {where_sql}
+                GROUP BY taille_entreprise
+                ORDER BY nb_entreprises DESC
+                """,
+                params,
+            )
+            taille_rows = cursor.fetchall()
+
+        global_stats = {
+            "nb_entreprises": row[0] or 0,
             "total_entreprises": row[0] or 0,
             "total_mpme_formalisees": row[1] or 0,
             "total_mpme_appuyees_fiere": row[2] or 0,
+        }
+
+        data = {
+            "global": global_stats,
+            "by_taille": [
+                {
+                    "taille_entreprise": r[0],
+                    "taille_label": r[0] or "Non renseigne",
+                    "nb_entreprises": r[1] or 0,
+                }
+                for r in taille_rows
+            ],
         }
 
         return Response(data)
@@ -433,7 +1228,7 @@ class EntrepriseAggregationView(CurrentProjectRequiredMixin, GenericAPIView):
 class ActeurParticipationListView(CurrentProjectRequiredMixin, GenericAPIView):
     """
     Liste les acteurs / partenaires depuis la vue marts.vw_acteur_participation,
-    filtrés par projet actif via project_code (FIERE / AGRIECO).
+    filtrÃ©s par projet actif via project_code (FIERE / AGRIECO).
 
     Filtres possibles en query string :
     - ?search=...                     (nom_acteur, intitule_dispositif,
@@ -447,7 +1242,7 @@ class ActeurParticipationListView(CurrentProjectRequiredMixin, GenericAPIView):
     - ?statut_convention=...         (code ref.statut_convention_cfpa)
     - ?convention_cfpa_active=true|false
     - ?id_ent=...
-    - ?has_geom=true|false           (présence de géométrie)
+    - ?has_geom=true|false           (prÃ©sence de gÃ©omÃ©trie)
     """
 
     permission_classes = [IsAuthenticated]
@@ -475,8 +1270,7 @@ class ActeurParticipationListView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -491,7 +1285,7 @@ class ActeurParticipationListView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Caractéristiques de la participation
+        # CaractÃ©ristiques de la participation
         if type_acteur:
             where_clauses.append("type_acteur = %s")
             params.append(type_acteur)
@@ -505,8 +1299,7 @@ class ActeurParticipationListView(CurrentProjectRequiredMixin, GenericAPIView):
             params.append(statut_convention)
 
         if convention_cfpa_active in ("true", "false"):
-            where_clauses.append("convention_cfpa_active = %s")
-            params.append(convention_cfpa_active == "true")
+            where_clauses.append(sql_bool("convention_cfpa_active", convention_cfpa_active == "true"))
 
         if id_ent:
             where_clauses.append("id_ent = %s")
@@ -560,7 +1353,7 @@ class ActeurParticipationListView(CurrentProjectRequiredMixin, GenericAPIView):
         offset = (page - 1) * page_size
         limit = page_size
 
-        # -------- Requêtes SQL --------
+        # -------- RequÃªtes SQL --------
         with connection.cursor() as cursor:
             # 1) Total
             cursor.execute(
@@ -573,7 +1366,7 @@ class ActeurParticipationListView(CurrentProjectRequiredMixin, GenericAPIView):
             )
             total = cursor.fetchone()[0]
 
-            # 2) Lignes paginées
+            # 2) Lignes paginÃ©es
             cursor.execute(
                 f"""
                 SELECT *
@@ -611,10 +1404,10 @@ class ActeurParticipationListView(CurrentProjectRequiredMixin, GenericAPIView):
 
 class ActeurParticipationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Agrégations pour les acteurs de participation (marts.vw_acteur_participation),
-    filtrées par projet actif (FIERE / AGRIECO) et par territoire.
+    AgrÃ©gations pour les acteurs de participation (marts.vw_acteur_participation),
+    filtrÃ©es par projet actif (FIERE / AGRIECO) et par territoire.
 
-    Même filtres que la liste :
+    MÃªme filtres que la liste :
     - ?search=...
     - ?region_id=...
     - ?prefecture_id=...
@@ -651,8 +1444,7 @@ class ActeurParticipationAggregatesView(CurrentProjectRequiredMixin, GenericAPIV
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -667,7 +1459,7 @@ class ActeurParticipationAggregatesView(CurrentProjectRequiredMixin, GenericAPIV
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Caractéristiques de la participation
+        # CaractÃ©ristiques de la participation
         if type_acteur:
             where_clauses.append("type_acteur = %s")
             params.append(type_acteur)
@@ -681,8 +1473,7 @@ class ActeurParticipationAggregatesView(CurrentProjectRequiredMixin, GenericAPIV
             params.append(statut_convention)
 
         if convention_cfpa_active in ("true", "false"):
-            where_clauses.append("convention_cfpa_active = %s")
-            params.append(convention_cfpa_active == "true")
+            where_clauses.append(sql_bool("convention_cfpa_active", convention_cfpa_active == "true"))
 
         if id_ent:
             where_clauses.append("id_ent = %s")
@@ -694,7 +1485,7 @@ class ActeurParticipationAggregatesView(CurrentProjectRequiredMixin, GenericAPIV
             else:
                 where_clauses.append("geom IS NULL")
 
-        # Recherche texte (cohérente avec la liste)
+        # Recherche texte (cohÃ©rente avec la liste)
         if search:
             where_clauses.append(
                 "("
@@ -728,7 +1519,7 @@ class ActeurParticipationAggregatesView(CurrentProjectRequiredMixin, GenericAPIV
                         WHERE type_participation = 'CONV_CFPA_ENT'
                     ) AS nb_conventions_cfpa,
                     COUNT(*) FILTER (
-                        WHERE convention_cfpa_active = TRUE
+                        WHERE {sql_true("convention_cfpa_active")}
                     ) AS nb_conventions_cfpa_actives,
                     COALESCE(SUM(nb_part_12m), 0) AS total_nb_part_12m,
                     AVG(nb_part_12m::numeric) AS avg_nb_part_12m,
@@ -743,10 +1534,14 @@ class ActeurParticipationAggregatesView(CurrentProjectRequiredMixin, GenericAPIV
             data["global"] = {
                 "total_participations": row[0],
                 "distinct_acteurs": row[1],
+                "total_acteurs": row[1],  # alias dashboard
+                "nb_acteurs": row[1],     # alias dashboard
                 "nb_entreprises_fiere": row[2],
                 "nb_conventions_cfpa": row[3],
                 "nb_conventions_cfpa_actives": row[4],
+                "nb_partenariats_actifs": row[4],  # alias dashboard
                 "total_nb_part_12m": row[5],
+                "nb_stages_courts": 0,  # pas de source fiable dans ce mart
                 "avg_nb_part_12m": float(row[6]) if row[6] is not None else None,
                 "nb_avec_geom": row[7],
                 "nb_sans_geom": row[8],
@@ -759,7 +1554,7 @@ class ActeurParticipationAggregatesView(CurrentProjectRequiredMixin, GenericAPIV
                     type_acteur,
                     COALESCE(type_acteur_label, type_acteur) AS label,
                     COUNT(*) AS total,
-                    COUNT(*) FILTER (WHERE convention_cfpa_active = TRUE)
+                    COUNT(*) FILTER (WHERE {sql_true("convention_cfpa_active")})
                         AS conventions_actives
                 FROM marts.vw_acteur_participation
                 WHERE {where_sql}
@@ -786,7 +1581,7 @@ class ActeurParticipationAggregatesView(CurrentProjectRequiredMixin, GenericAPIV
                     type_participation,
                     COALESCE(type_participation_label, type_participation) AS label,
                     COUNT(*) AS total,
-                    COUNT(*) FILTER (WHERE convention_cfpa_active = TRUE)
+                    COUNT(*) FILTER (WHERE {sql_true("convention_cfpa_active")})
                         AS conventions_actives
                 FROM marts.vw_acteur_participation
                 WHERE {where_sql}
@@ -832,7 +1627,7 @@ class ActeurParticipationAggregatesView(CurrentProjectRequiredMixin, GenericAPIV
                 for r in rows
             ]
 
-            # ---- 5) Par fréquence de participation ----
+            # ---- 5) Par frÃ©quence de participation ----
             cursor.execute(
                 f"""
                 SELECT
@@ -908,14 +1703,14 @@ class ActeurParticipationAggregatesView(CurrentProjectRequiredMixin, GenericAPIV
                 for r in rows
             ]
 
-            # ---- 8) Par région ----
+            # ---- 8) Par rÃ©gion ----
             cursor.execute(
                 f"""
                 SELECT
                     id_region,
                     region_nom,
                     COUNT(*) AS total,
-                    COUNT(*) FILTER (WHERE convention_cfpa_active = TRUE)
+                    COUNT(*) FILTER (WHERE {sql_true("convention_cfpa_active")})
                         AS conventions_actives
                 FROM marts.vw_acteur_participation
                 WHERE {where_sql}
@@ -935,14 +1730,14 @@ class ActeurParticipationAggregatesView(CurrentProjectRequiredMixin, GenericAPIV
                 for r in rows
             ]
 
-            # ---- 9) Par préfecture ----
+            # ---- 9) Par prÃ©fecture ----
             cursor.execute(
                 f"""
                 SELECT
                     id_prefecture,
                     prefecture_nom,
                     COUNT(*) AS total,
-                    COUNT(*) FILTER (WHERE convention_cfpa_active = TRUE)
+                    COUNT(*) FILTER (WHERE {sql_true("convention_cfpa_active")})
                         AS conventions_actives
                 FROM marts.vw_acteur_participation
                 WHERE {where_sql}
@@ -969,7 +1764,7 @@ class ActeurParticipationAggregatesView(CurrentProjectRequiredMixin, GenericAPIV
                     id_commune,
                     commune_nom,
                     COUNT(*) AS total,
-                    COUNT(*) FILTER (WHERE convention_cfpa_active = TRUE)
+                    COUNT(*) FILTER (WHERE {sql_true("convention_cfpa_active")})
                         AS conventions_actives
                 FROM marts.vw_acteur_participation
                 WHERE {where_sql}
@@ -995,13 +1790,13 @@ class ActeurParticipationAggregatesView(CurrentProjectRequiredMixin, GenericAPIV
 
 
 # -----------------------------------------------------------------------------
-# Liste des comité
+# Liste des comitÃ©
 # -----------------------------------------------------------------------------
 
 class AgrComiteListView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Liste les comités agricoles depuis la vue marts.vw_agr_comite,
-    filtrés par projet actif via project_code (FIERE / AGRIECO).
+    Liste les comitÃ©s agricoles depuis la vue marts.vw_agr_comite,
+    filtrÃ©s par projet actif via project_code (FIERE / AGRIECO).
 
     Filtres possibles en query string :
     - ?search=...                (nom_comite, zone_couverture, principaux_resultats,
@@ -1039,8 +1834,7 @@ class AgrComiteListView(CurrentProjectRequiredMixin, GenericAPIView):
 
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -1055,7 +1849,7 @@ class AgrComiteListView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Caractéristiques du comité
+        # CaractÃ©ristiques du comitÃ©
         if type_comite:
             where_clauses.append("type_comite = %s")
             params.append(type_comite)
@@ -1065,8 +1859,7 @@ class AgrComiteListView(CurrentProjectRequiredMixin, GenericAPIView):
             params.append(statut_comite)
 
         if suit_conflits in ("true", "false"):
-            where_clauses.append("suit_conflits = %s")
-            params.append(suit_conflits == "true")
+            where_clauses.append(sql_bool("suit_conflits", suit_conflits == "true"))
 
         if has_geom in ("true", "false"):
             if has_geom == "true":
@@ -1129,7 +1922,7 @@ class AgrComiteListView(CurrentProjectRequiredMixin, GenericAPIView):
             )
             total = cursor.fetchone()[0]
 
-            # 2) Lignes paginées
+            # 2) Lignes paginÃ©es
             cursor.execute(
                 f"""
                 SELECT *
@@ -1166,10 +1959,10 @@ class AgrComiteListView(CurrentProjectRequiredMixin, GenericAPIView):
 
 class AgrComiteAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Agrégations pour les comités agricoles (marts.vw_agr_comite),
-    filtrées par projet actif (FIERE / AGRIECO) et par territoire.
+    AgrÃ©gations pour les comitÃ©s agricoles (marts.vw_agr_comite),
+    filtrÃ©es par projet actif (FIERE / AGRIECO) et par territoire.
 
-    Filtres (identiques à la liste) :
+    Filtres (identiques Ã  la liste) :
     - ?search=...
     - ?region_id=...
     - ?prefecture_id=...
@@ -1201,8 +1994,7 @@ class AgrComiteAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -1217,7 +2009,7 @@ class AgrComiteAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Caractéristiques du comité
+        # CaractÃ©ristiques du comitÃ©
         if type_comite:
             where_clauses.append("type_comite = %s")
             params.append(type_comite)
@@ -1227,8 +2019,7 @@ class AgrComiteAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             params.append(statut_comite)
 
         if suit_conflits in ("true", "false"):
-            where_clauses.append("suit_conflits = %s")
-            params.append(suit_conflits == "true")
+            where_clauses.append(sql_bool("suit_conflits", suit_conflits == "true"))
 
         if has_geom in ("true", "false"):
             if has_geom == "true":
@@ -1236,7 +2027,7 @@ class AgrComiteAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             else:
                 where_clauses.append("geom IS NULL")
 
-        # Recherche texte cohérente avec la liste
+        # Recherche texte cohÃ©rente avec la liste
         if search:
             where_clauses.append(
                 "("
@@ -1272,7 +2063,7 @@ class AgrComiteAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                     AVG(nb_membres_total::numeric) AS avg_membres_par_comite,
                     COALESCE(SUM(nb_reunions_12m), 0) AS total_reunions_12m,
                     COALESCE(SUM(nb_sensib_12m), 0) AS total_sensibilisations_12m,
-                    COUNT(*) FILTER (WHERE suit_conflits = TRUE) AS nb_comites_suivi_conflits,
+                    COUNT(*) FILTER (WHERE {sql_true("suit_conflits")}) AS nb_comites_suivi_conflits,
                     COALESCE(SUM(nb_conflits_12m), 0) AS total_conflits_12m,
                     COALESCE(SUM(nb_conflits_regles), 0) AS total_conflits_regles,
                     CASE
@@ -1286,7 +2077,8 @@ class AgrComiteAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                     END AS taux_conflits_regles_pct,
                     COALESCE(SUM(nb_techniciens_total), 0) AS total_techniciens,
                     COUNT(*) FILTER (WHERE geom IS NOT NULL) AS nb_avec_geom,
-                    COUNT(*) FILTER (WHERE geom IS NULL) AS nb_sans_geom
+                    COUNT(*) FILTER (WHERE geom IS NULL) AS nb_sans_geom,
+                    COUNT(*) FILTER (WHERE type_comite = 'COMITE_FEUX') AS nb_comites_feux
                 FROM marts.vw_agr_comite
                 WHERE {where_sql}
                 """,
@@ -1307,11 +2099,13 @@ class AgrComiteAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 "total_conflits_regles": row[10],
                 "taux_conflits_regles_pct": float(row[11]) if row[11] is not None else None,
                 "total_techniciens": row[12],
+                "nb_techniciens_formes": row[12],  # alias front
                 "nb_avec_geom": row[13],
                 "nb_sans_geom": row[14],
+                "nb_comites_feux": row[15],
             }
 
-            # ---- 2) Par type de comité ----
+            # ---- 2) Par type de comitÃ© ----
             cursor.execute(
                 f"""
                 SELECT
@@ -1332,8 +2126,11 @@ class AgrComiteAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             data["by_type_comite"] = [
                 {
                     "type_comite": r[0],
+                    "type_comite_label": r[1],  # alias front
                     "label": r[1],
                     "total": r[2],
+                    "nb_comites": r[2],         # alias front (charts)
+                    "total_comites": r[2],      # alias front (charts)
                     "total_membres": r[3],
                     "total_membres_femmes": r[4],
                     "total_membres_jeunes": r[5],
@@ -1341,7 +2138,7 @@ class AgrComiteAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 for r in rows
             ]
 
-            # ---- 3) Par statut de comité ----
+            # ---- 3) Par statut de comitÃ© ----
             cursor.execute(
                 f"""
                 SELECT
@@ -1391,7 +2188,7 @@ class AgrComiteAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 for r in rows
             ]
 
-            # ---- 5) Par région ----
+            # ---- 5) Par rÃ©gion ----
             cursor.execute(
                 f"""
                 SELECT
@@ -1423,7 +2220,7 @@ class AgrComiteAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 for r in rows
             ]
 
-            # ---- 6) Par préfecture ----
+            # ---- 6) Par prÃ©fecture ----
             cursor.execute(
                 f"""
                 SELECT
@@ -1509,7 +2306,7 @@ class AgrComiteAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 for r in rows
             ]
 
-            # ---- 9) Par thème du comité (multi-valeurs) ----
+            # ---- 9) Par thÃ¨me du comitÃ© (multi-valeurs) ----
             cursor.execute(
                 f"""
                 SELECT
@@ -1569,14 +2366,14 @@ class AgrComiteAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
 
 
 # -----------------------------------------------------------------------------
-# Liste des ménages
+# Liste des mÃ©nages
 # -----------------------------------------------------------------------------
 
 
 class AgrMenageListView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Liste les ménages agricoles depuis la vue marts.vw_agr_menage,
-    filtrés par projet actif via project_code (FIERE / AGRIECO).
+    Liste les mÃ©nages agricoles depuis la vue marts.vw_agr_menage,
+    filtrÃ©s par projet actif via project_code (FIERE / AGRIECO).
 
     Filtres possibles en query string :
     - ?search=...                    (nom_chef_menage, obs_sensib, obs_foyer,
@@ -1622,8 +2419,7 @@ class AgrMenageListView(CurrentProjectRequiredMixin, GenericAPIView):
 
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -1638,26 +2434,24 @@ class AgrMenageListView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Caractéristiques du ménage
+        # CaractÃ©ristiques du mÃ©nage
         if type_menage:
             where_clauses.append("type_menage = %s")
             params.append(type_menage)
 
         if menage_prat_agroeco in ("true", "false"):
-            where_clauses.append("menage_prat_agroeco = %s")
-            params.append(menage_prat_agroeco == "true")
+            where_clauses.append(sql_bool("menage_prat_agroeco", menage_prat_agroeco == "true"))
 
         if applique_bonnes_prat_nutrition in ("true", "false"):
-            where_clauses.append("applique_bonnes_prat_nutrition = %s")
-            params.append(applique_bonnes_prat_nutrition == "true")
+            where_clauses.append(
+                sql_bool("applique_bonnes_prat_nutrition", applique_bonnes_prat_nutrition == "true")
+            )
 
         if utilise_intrants_chimiques in ("true", "false"):
-            where_clauses.append("utilise_intrants_chimiques = %s")
-            params.append(utilise_intrants_chimiques == "true")
+            where_clauses.append(sql_bool("utilise_intrants_chimiques", utilise_intrants_chimiques == "true"))
 
         if utilise_foyer_ameliore in ("true", "false"):
-            where_clauses.append("utilise_foyer_ameliore = %s")
-            params.append(utilise_foyer_ameliore == "true")
+            where_clauses.append(sql_bool("utilise_foyer_ameliore", utilise_foyer_ameliore == "true"))
 
         if has_geom in ("true", "false"):
             if has_geom == "true":
@@ -1718,7 +2512,7 @@ class AgrMenageListView(CurrentProjectRequiredMixin, GenericAPIView):
             )
             total = cursor.fetchone()[0]
 
-            # 2) Lignes paginées
+            # 2) Lignes paginÃ©es
             cursor.execute(
                 f"""
                 SELECT *
@@ -1755,10 +2549,10 @@ class AgrMenageListView(CurrentProjectRequiredMixin, GenericAPIView):
 
 class AgrMenageAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Agrégations pour les ménages agricoles (marts.vw_agr_menage),
-    filtrées par projet actif (FIERE / AGRIECO) et par territoire.
+    AgrÃ©gations pour les mÃ©nages agricoles (marts.vw_agr_menage),
+    filtrÃ©es par projet actif (FIERE / AGRIECO) et par territoire.
 
-    Filtres (alignés avec la liste) :
+    Filtres (alignÃ©s avec la liste) :
     - ?search=...
     - ?region_id=...
     - ?prefecture_id=...
@@ -1800,8 +2594,7 @@ class AgrMenageAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
 
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -1816,26 +2609,24 @@ class AgrMenageAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Caractéristiques
+        # CaractÃ©ristiques
         if type_menage:
             where_clauses.append("type_menage = %s")
             params.append(type_menage)
 
         if menage_prat_agroeco in ("true", "false"):
-            where_clauses.append("menage_prat_agroeco = %s")
-            params.append(menage_prat_agroeco == "true")
+            where_clauses.append(sql_bool("menage_prat_agroeco", menage_prat_agroeco == "true"))
 
         if applique_bonnes_prat_nutrition in ("true", "false"):
-            where_clauses.append("applique_bonnes_prat_nutrition = %s")
-            params.append(applique_bonnes_prat_nutrition == "true")
+            where_clauses.append(
+                sql_bool("applique_bonnes_prat_nutrition", applique_bonnes_prat_nutrition == "true")
+            )
 
         if utilise_intrants_chimiques in ("true", "false"):
-            where_clauses.append("utilise_intrants_chimiques = %s")
-            params.append(utilise_intrants_chimiques == "true")
+            where_clauses.append(sql_bool("utilise_intrants_chimiques", utilise_intrants_chimiques == "true"))
 
         if utilise_foyer_ameliore in ("true", "false"):
-            where_clauses.append("utilise_foyer_ameliore = %s")
-            params.append(utilise_foyer_ameliore == "true")
+            where_clauses.append(sql_bool("utilise_foyer_ameliore", utilise_foyer_ameliore == "true"))
 
         if has_geom in ("true", "false"):
             if has_geom == "true":
@@ -1870,11 +2661,11 @@ class AgrMenageAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                     COUNT(*) AS total_menages,
                     COALESCE(SUM(nb_personnes), 0) AS total_personnes,
                     COALESCE(SUM(nb_enfants_u5), 0) AS total_enfants_u5,
-                    COUNT(*) FILTER (WHERE menage_prat_agroeco = TRUE) AS nb_menages_prat_agroeco,
-                    COUNT(*) FILTER (WHERE utilise_intrants_chimiques = TRUE) AS nb_menages_intrants_chimiques,
-                    COUNT(*) FILTER (WHERE applique_bonnes_pratiques_intrants = TRUE) AS nb_menages_bonnes_pratiques_intrants,
-                    COUNT(*) FILTER (WHERE utilise_foyer_ameliore = TRUE) AS nb_menages_foyer_ameliore,
-                    COUNT(*) FILTER (WHERE applique_bonnes_prat_nutrition = TRUE) AS nb_menages_bonnes_pratiques_nutrition,
+                    COUNT(*) FILTER (WHERE {sql_true("menage_prat_agroeco")}) AS nb_menages_prat_agroeco,
+                    COUNT(*) FILTER (WHERE {sql_true("utilise_intrants_chimiques")}) AS nb_menages_intrants_chimiques,
+                    COUNT(*) FILTER (WHERE {sql_true("applique_bonnes_pratiques_intrants")}) AS nb_menages_bonnes_pratiques_intrants,
+                    COUNT(*) FILTER (WHERE {sql_true("utilise_foyer_ameliore")}) AS nb_menages_foyer_ameliore,
+                    COUNT(*) FILTER (WHERE {sql_true("applique_bonnes_prat_nutrition")}) AS nb_menages_bonnes_pratiques_nutrition,
                     COALESCE(SUM(nb_seances_total), 0) AS total_seances_sensib,
                     COUNT(*) FILTER (WHERE geom IS NOT NULL) AS nb_avec_geom,
                     COUNT(*) FILTER (WHERE geom IS NULL) AS nb_sans_geom
@@ -1892,13 +2683,14 @@ class AgrMenageAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 "nb_menages_intrants_chimiques": row[4],
                 "nb_menages_bonnes_pratiques_intrants": row[5],
                 "nb_menages_foyer_ameliore": row[6],
+                "nb_menages_foyers_ameliores": row[6],  # alias pluriel pour le front
                 "nb_menages_bonnes_pratiques_nutrition": row[7],
                 "total_seances_sensib": row[8],
                 "nb_avec_geom": row[9],
                 "nb_sans_geom": row[10],
             }
 
-            # ---- 2) Par type de ménage ----
+            # ---- 2) Par type de mÃ©nage ----
             cursor.execute(
                 f"""
                 SELECT
@@ -1933,7 +2725,7 @@ class AgrMenageAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                     type_foyer_principal,
                     COALESCE(type_foyer_principal_label, type_foyer_principal) AS label,
                     COUNT(*) AS total_menages,
-                    COUNT(*) FILTER (WHERE utilise_foyer_ameliore = TRUE) AS nb_menages_foyer_ameliore
+                    COUNT(*) FILTER (WHERE {sql_true("utilise_foyer_ameliore")}) AS nb_menages_foyer_ameliore
                 FROM marts.vw_agr_menage
                 WHERE {where_sql}
                 GROUP BY type_foyer_principal, COALESCE(type_foyer_principal_label, type_foyer_principal)
@@ -1952,14 +2744,14 @@ class AgrMenageAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 for r in rows
             ]
 
-            # ---- 4) Par fréquence des pratiques nutrition ----
+            # ---- 4) Par frÃ©quence des pratiques nutrition ----
             cursor.execute(
                 f"""
                 SELECT
                     frequence_pratiques_nutrition,
                     COALESCE(frequence_pratiques_nutrition_label, frequence_pratiques_nutrition) AS label,
                     COUNT(*) AS total_menages,
-                    COUNT(*) FILTER (WHERE applique_bonnes_prat_nutrition = TRUE) AS nb_menages_bonnes_pratiques_nutrition
+                    COUNT(*) FILTER (WHERE {sql_true("applique_bonnes_prat_nutrition")}) AS nb_menages_bonnes_pratiques_nutrition
                 FROM marts.vw_agr_menage
                 WHERE {where_sql}
                 GROUP BY frequence_pratiques_nutrition, COALESCE(frequence_pratiques_nutrition_label, frequence_pratiques_nutrition)
@@ -1978,7 +2770,7 @@ class AgrMenageAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 for r in rows
             ]
 
-            # ---- 5) Par région ----
+            # ---- 5) Par rÃ©gion ----
             cursor.execute(
                 f"""
                 SELECT
@@ -2008,7 +2800,7 @@ class AgrMenageAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 for r in rows
             ]
 
-            # ---- 6) Par préfecture ----
+            # ---- 6) Par prÃ©fecture ----
             cursor.execute(
                 f"""
                 SELECT
@@ -2060,7 +2852,7 @@ class AgrMenageAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 for r in rows
             ]
 
-            # ---- 8) Par thèmes de sensibilisation (multi-valeurs) ----
+            # ---- 8) Par thÃ¨mes de sensibilisation (multi-valeurs) ----
             cursor.execute(
                 f"""
                 SELECT
@@ -2114,7 +2906,7 @@ class AgrMenageAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 for r in rows
             ]
 
-            # ---- 10) Par pratiques agroécologiques (multi-valeurs) ----
+            # ---- 10) Par pratiques agroÃ©cologiques (multi-valeurs) ----
             cursor.execute(
                 f"""
                 SELECT
@@ -2177,7 +2969,7 @@ class AgrMenageAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
 class AgrOrganisationListView(CurrentProjectRequiredMixin, GenericAPIView):
     """
     Liste les organisations agricoles depuis la vue marts.vw_agr_organisation,
-    filtrées par projet actif via project_code (FIERE / AGRIECO).
+    filtrÃ©es par projet actif via project_code (FIERE / AGRIECO).
 
     Filtres possibles en query string :
     - ?search=...                 (id_org, obs_org, activites_principales_labels,
@@ -2214,8 +3006,7 @@ class AgrOrganisationListView(CurrentProjectRequiredMixin, GenericAPIView):
 
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -2230,7 +3021,7 @@ class AgrOrganisationListView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Caractéristiques de l'organisation
+        # CaractÃ©ristiques de l'organisation
         if type_org:
             where_clauses.append("type_org = %s")
             params.append(type_org)
@@ -2305,7 +3096,7 @@ class AgrOrganisationListView(CurrentProjectRequiredMixin, GenericAPIView):
             )
             total = cursor.fetchone()[0]
 
-            # 2) Lignes paginées
+            # 2) Lignes paginÃ©es
             cursor.execute(
                 f"""
                 SELECT *
@@ -2342,10 +3133,10 @@ class AgrOrganisationListView(CurrentProjectRequiredMixin, GenericAPIView):
 
 class AgrOrganisationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Agrégations pour les organisations agricoles (marts.vw_agr_organisation),
-    filtrées par projet actif (FIERE / AGRIECO) et par territoire.
+    AgrÃ©gations pour les organisations agricoles (marts.vw_agr_organisation),
+    filtrÃ©es par projet actif (FIERE / AGRIECO) et par territoire.
 
-    Filtres (alignés avec la liste) :
+    Filtres (alignÃ©s avec la liste) :
     - ?search=...
     - ?region_id=...
     - ?prefecture_id=...
@@ -2378,8 +3169,7 @@ class AgrOrganisationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
 
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -2394,7 +3184,7 @@ class AgrOrganisationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Caractéristiques
+        # CaractÃ©ristiques
         if type_org:
             where_clauses.append("type_org = %s")
             params.append(type_org)
@@ -2455,7 +3245,14 @@ class AgrOrganisationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
                     COALESCE(SUM(nb_ruches_autres), 0) AS total_ruches_autres,
                     COALESCE(SUM(nb_emplois_verts), 0) AS total_emplois_verts,
                     COUNT(*) FILTER (WHERE geom IS NOT NULL) AS nb_avec_geom,
-                    COUNT(*) FILTER (WHERE geom IS NULL) AS nb_sans_geom
+                    COUNT(*) FILTER (WHERE geom IS NULL) AS nb_sans_geom,
+                    COUNT(*) FILTER (WHERE type_org = 'OP') AS nb_op,
+                    COUNT(*) FILTER (
+                        WHERE nb_bovins > 0 OR nb_ovins > 0 OR nb_caprins > 0
+                    ) AS nb_groupements_eleveurs,
+                    COALESCE(
+                        SUM(nb_ruches_ken) + SUM(nb_ruches_lang) + SUM(nb_ruches_autres), 0
+                    ) AS nb_ruches
                 FROM marts.vw_agr_organisation
                 WHERE {where_sql}
                 """,
@@ -2470,7 +3267,9 @@ class AgrOrganisationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
                 "nb_org_pratiques_adoptees_oui": row[4],
                 "total_planteurs_accompagnes": row[5],
                 "total_producteurs_semenciers": row[6],
+                "nb_producteurs_semenciers": row[6],   # alias front
                 "total_banques_semences": row[7],
+                "nb_banques_semences": row[7],          # alias front
                 "total_bovins": row[8],
                 "total_ovins": row[9],
                 "total_caprins": row[10],
@@ -2480,6 +3279,10 @@ class AgrOrganisationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
                 "total_emplois_verts": row[14],
                 "nb_avec_geom": row[15],
                 "nb_sans_geom": row[16],
+                "nb_op": row[17],
+                "nb_groupements_eleveurs": row[18],
+                "nb_ruches": row[19],
+                "nb_officines_vet": 0,                  # pas de source disponible
             }
 
             # ---- 2) Par type d'organisation ----
@@ -2504,8 +3307,10 @@ class AgrOrganisationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
             data["by_type_org"] = [
                 {
                     "type_org": r[0],
+                    "type_org_label": r[1],     # alias front
                     "label": r[1],
                     "total_organisations": r[2],
+                    "nb_org": r[2],             # alias front (charts)
                     "total_membres": r[3],
                     "total_membres_femmes": r[4],
                     "total_membres_jeunes": r[5],
@@ -2540,7 +3345,7 @@ class AgrOrganisationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
                 for r in rows
             ]
 
-            # ---- 4) Par région ----
+            # ---- 4) Par rÃ©gion ----
             cursor.execute(
                 f"""
                 SELECT
@@ -2568,7 +3373,7 @@ class AgrOrganisationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
                 for r in rows
             ]
 
-            # ---- 5) Par préfecture ----
+            # ---- 5) Par prÃ©fecture ----
             cursor.execute(
                 f"""
                 SELECT
@@ -2620,7 +3425,7 @@ class AgrOrganisationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
                 for r in rows
             ]
 
-            # ---- 7) Par filière principale (multi-valeurs) ----
+            # ---- 7) Par filiÃ¨re principale (multi-valeurs) ----
             cursor.execute(
                 f"""
                 SELECT
@@ -2648,7 +3453,7 @@ class AgrOrganisationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
                 for r in rows
             ]
 
-            # ---- 8) Par activités principales (multi-valeurs) ----
+            # ---- 8) Par activitÃ©s principales (multi-valeurs) ----
             cursor.execute(
                 f"""
                 SELECT
@@ -2674,7 +3479,7 @@ class AgrOrganisationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
                 for r in rows
             ]
 
-            # ---- 9) Par pratiques agroécologiques adoptées (multi-valeurs) ----
+            # ---- 9) Par pratiques agroÃ©cologiques adoptÃ©es (multi-valeurs) ----
             cursor.execute(
                 f"""
                 SELECT
@@ -2711,7 +3516,7 @@ class AgrOrganisationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
 class CepParcelleListView(CurrentProjectRequiredMixin, GenericAPIView):
     """
     Liste les parcelles CEP depuis la vue marts.vw_cep_parcelle,
-    filtrées par projet actif via project_code (FIERE / AGRIECO).
+    filtrÃ©es par projet actif via project_code (FIERE / AGRIECO).
 
     Filtres possibles en query string :
     - ?search=...                 (id_cep, filiere_label, commune_nom, region_nom)
@@ -2719,8 +3524,8 @@ class CepParcelleListView(CurrentProjectRequiredMixin, GenericAPIView):
     - ?prefecture_id=...
     - ?commune_id=...
     - ?filiere=...                (code ref.filiere)
-    - ?campagne=2023              (année campagne_yyyy)
-    - ?has_geom=true|false        (présence de géométrie)
+    - ?campagne=2023              (annÃ©e campagne_yyyy)
+    - ?has_geom=true|false        (prÃ©sence de gÃ©omÃ©trie)
     """
 
     permission_classes = [IsAuthenticated]
@@ -2743,8 +3548,7 @@ class CepParcelleListView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -2759,13 +3563,13 @@ class CepParcelleListView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Caractéristiques
+        # CaractÃ©ristiques
         if filiere:
             where_clauses.append("filiere = %s")
             params.append(filiere)
 
         if campagne:
-            # campagne_yyyy est un entier (année) côté DB, mais %s cast OK
+            # campagne_yyyy est un entier (annÃ©e) cÃ´tÃ© DB, mais %s cast OK
             where_clauses.append("campagne_yyyy = %s")
             params.append(campagne)
 
@@ -2826,7 +3630,7 @@ class CepParcelleListView(CurrentProjectRequiredMixin, GenericAPIView):
             )
             total = cursor.fetchone()[0]
 
-            # 2) Lignes paginées
+            # 2) Lignes paginÃ©es
             cursor.execute(
                 f"""
                 SELECT *
@@ -2863,8 +3667,8 @@ class CepParcelleListView(CurrentProjectRequiredMixin, GenericAPIView):
 
 class CepParcelleAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Agrégations pour les parcelles CEP (marts.vw_cep_parcelle),
-    filtrées par projet actif (FIERE / AGRIECO) et territoire.
+    AgrÃ©gations pour les parcelles CEP (marts.vw_cep_parcelle),
+    filtrÃ©es par projet actif (FIERE / AGRIECO) et territoire.
 
     Filtres :
     - ?search=...      (id_cep, filiere_label, commune_nom, region_nom)
@@ -2896,8 +3700,7 @@ class CepParcelleAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -2912,7 +3715,7 @@ class CepParcelleAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Caractéristiques
+        # CaractÃ©ristiques
         if filiere:
             where_clauses.append("filiere = %s")
             params.append(filiere)
@@ -2974,7 +3777,7 @@ class CepParcelleAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 "nb_sans_geom": row[7],
             }
 
-            # ---- 2) Par filière ----
+            # ---- 2) Par filiÃ¨re ----
             cursor.execute(
                 f"""
                 SELECT
@@ -2996,6 +3799,7 @@ class CepParcelleAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 {
                     "filiere": r[0],
                     "label": r[1],
+                    "filiere_label": r[1],  # alias front
                     "nb_parcelles": r[2],
                     "total_surface_decl_ha": float(r[3]) if r[3] is not None else 0.0,
                     "total_menages_beneficiaires": r[4],
@@ -3024,6 +3828,7 @@ class CepParcelleAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             data["by_campagne"] = [
                 {
                     "campagne_yyyy": r[0],
+                    "campagne": r[0],       # alias front
                     "nb_parcelles": r[1],
                     "total_surface_decl_ha": float(r[2]) if r[2] is not None else 0.0,
                     "total_menages_beneficiaires": r[3],
@@ -3032,7 +3837,7 @@ class CepParcelleAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 for r in rows
             ]
 
-            # ---- 4) Par région ----
+            # ---- 4) Par rÃ©gion ----
             cursor.execute(
                 f"""
                 SELECT
@@ -3060,7 +3865,7 @@ class CepParcelleAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 for r in rows
             ]
 
-            # ---- 5) Par préfecture ----
+            # ---- 5) Par prÃ©fecture ----
             cursor.execute(
                 f"""
                 SELECT
@@ -3112,7 +3917,7 @@ class CepParcelleAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 for r in rows
             ]
 
-            # ---- 7) Région x filière (croisement pour cartes / graphiques) ----
+            # ---- 7) RÃ©gion x filiÃ¨re (croisement pour cartes / graphiques) ----
             cursor.execute(
                 f"""
                 SELECT
@@ -3146,7 +3951,7 @@ class CepParcelleAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 for r in rows
             ]
 
-            # ---- 8) Par pratiques agroécologiques (multi-valeurs) ----
+            # ---- 8) Par pratiques agroÃ©cologiques (multi-valeurs) ----
             cursor.execute(
                 f"""
                 SELECT
@@ -3185,7 +3990,7 @@ class CepParcelleAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
 class CouloirListView(CurrentProjectRequiredMixin, GenericAPIView):
     """
     Liste les couloirs de transhumance depuis la vue marts.vw_couloir,
-    filtrés par projet actif via project_code (FIERE / AGRIECO).
+    filtrÃ©s par projet actif via project_code (FIERE / AGRIECO).
 
     Filtres possibles en query string :
     - ?search=...                  (nom_couloir, localites_traversees,
@@ -3199,7 +4004,7 @@ class CouloirListView(CurrentProjectRequiredMixin, GenericAPIView):
     - ?saison_usage=...           (code ref.saison_usage)
     - ?statut_couloir=...         (code ref.statut_couloir)
     - ?appreciation_globale=...   (code ref.app_global)
-    - ?has_geom=true|false        (présence de géométrie)
+    - ?has_geom=true|false        (prÃ©sence de gÃ©omÃ©trie)
     """
 
     permission_classes = [IsAuthenticated]
@@ -3225,8 +4030,7 @@ class CouloirListView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -3241,7 +4045,7 @@ class CouloirListView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Caractéristiques
+        # CaractÃ©ristiques
         if type_couloir:
             where_clauses.append("type_couloir = %s")
             params.append(type_couloir)
@@ -3264,7 +4068,7 @@ class CouloirListView(CurrentProjectRequiredMixin, GenericAPIView):
             else:
                 where_clauses.append("geom IS NULL")
 
-        # Recherche texte élargie
+        # Recherche texte Ã©largie
         if search:
             where_clauses.append(
                 "("
@@ -3319,7 +4123,7 @@ class CouloirListView(CurrentProjectRequiredMixin, GenericAPIView):
             )
             total = cursor.fetchone()[0]
 
-            # 2) Lignes paginées
+            # 2) Lignes paginÃ©es
             cursor.execute(
                 f"""
                 SELECT *
@@ -3356,8 +4160,8 @@ class CouloirListView(CurrentProjectRequiredMixin, GenericAPIView):
 
 class CouloirAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Agrégations sur les couloirs de transhumance (marts.vw_couloir),
-    filtrées par projet actif (FIERE / AGRIECO) et territoire.
+    AgrÃ©gations sur les couloirs de transhumance (marts.vw_couloir),
+    filtrÃ©es par projet actif (FIERE / AGRIECO) et territoire.
 
     Filtres :
     - ?search=...
@@ -3394,8 +4198,7 @@ class CouloirAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -3410,7 +4213,7 @@ class CouloirAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Caractéristiques
+        # CaractÃ©ristiques
         if type_couloir:
             where_clauses.append("type_couloir = %s")
             params.append(type_couloir)
@@ -3541,7 +4344,7 @@ class CouloirAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 for r in rows
             ]
 
-            # ---- 4) Par saison d’usage ----
+            # ---- 4) Par saison dâ€™usage ----
             cursor.execute(
                 f"""
                 SELECT
@@ -3567,7 +4370,7 @@ class CouloirAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 for r in rows
             ]
 
-            # ---- 5) Par appréciation globale ----
+            # ---- 5) Par apprÃ©ciation globale ----
             cursor.execute(
                 f"""
                 SELECT
@@ -3593,7 +4396,7 @@ class CouloirAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 for r in rows
             ]
 
-            # ---- 6) Par région ----
+            # ---- 6) Par rÃ©gion ----
             cursor.execute(
                 f"""
                 SELECT
@@ -3619,7 +4422,7 @@ class CouloirAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 for r in rows
             ]
 
-            # ---- 7) Par préfecture ----
+            # ---- 7) Par prÃ©fecture ----
             cursor.execute(
                 f"""
                 SELECT
@@ -3671,7 +4474,7 @@ class CouloirAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 for r in rows
             ]
 
-            # ---- 9) Région x type de couloir ----
+            # ---- 9) RÃ©gion x type de couloir ----
             cursor.execute(
                 f"""
                 SELECT
@@ -3705,7 +4508,7 @@ class CouloirAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 for r in rows
             ]
 
-            # ---- 10) Par espèce de troupeau (multi-valeurs) ----
+            # ---- 10) Par espÃ¨ce de troupeau (multi-valeurs) ----
             cursor.execute(
                 f"""
                 SELECT
@@ -3733,7 +4536,7 @@ class CouloirAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 for r in rows
             ]
 
-            # ---- 11) Par type d’infrastructure pastorale (multi-valeurs) ----
+            # ---- 11) Par type dâ€™infrastructure pastorale (multi-valeurs) ----
             cursor.execute(
                 f"""
                 SELECT
@@ -3795,7 +4598,7 @@ class CouloirAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
 class EntEmploiDomListView(CurrentProjectRequiredMixin, GenericAPIView):
     """
     Liste les emplois par domaine (marts.vw_ent_emploi_dom),
-    filtrés par projet actif via project_code (FIERE / AGRIECO).
+    filtrÃ©s par projet actif via project_code (FIERE / AGRIECO).
 
     Filtres possibles en query string :
     - ?search=...                 (raison_sociale, domaine_label, domaine_autre,
@@ -3807,8 +4610,8 @@ class EntEmploiDomListView(CurrentProjectRequiredMixin, GenericAPIView):
     - ?periode_ref=ANNUEL       (code ref.periode_ref)
     - ?domaine_code=...         (code ref.domaine_emploi)
     - ?emploi_vert_dom=...      (valeur brute du champ, ex. 'oui'/'non' si c'est du texte)
-    - ?id_ent=...               (filtrer sur une entreprise spécifique)
-    - ?has_geom=true|false      (présence de géométrie)
+    - ?id_ent=...               (filtrer sur une entreprise spÃ©cifique)
+    - ?has_geom=true|false      (prÃ©sence de gÃ©omÃ©trie)
     """
 
     permission_classes = [IsAuthenticated]
@@ -3835,8 +4638,7 @@ class EntEmploiDomListView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -3932,7 +4734,7 @@ class EntEmploiDomListView(CurrentProjectRequiredMixin, GenericAPIView):
             )
             total = cursor.fetchone()[0]
 
-            # 2) Lignes paginées
+            # 2) Lignes paginÃ©es
             cursor.execute(
                 f"""
                 SELECT *
@@ -3969,10 +4771,10 @@ class EntEmploiDomListView(CurrentProjectRequiredMixin, GenericAPIView):
 
 class EntEmploiDomAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Agrégations sur les emplois par domaine (marts.vw_ent_emploi_dom),
-    filtrées par projet actif (FIERE / AGRIECO) et par territoire.
+    AgrÃ©gations sur les emplois par domaine (marts.vw_ent_emploi_dom),
+    filtrÃ©es par projet actif (FIERE / AGRIECO) et par territoire.
 
-    Même filtres que EntEmploiDomListView :
+    MÃªme filtres que EntEmploiDomListView :
     - ?search=...
     - ?region_id=...
     - ?prefecture_id=...
@@ -3995,7 +4797,7 @@ class EntEmploiDomAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
 
         project_code = project.code_fonc
 
-        # -------- Filtres (identiques à la ListView) --------
+        # -------- Filtres (identiques Ã  la ListView) --------
         region_id = request.query_params.get("region_id")
         prefecture_id = request.query_params.get("prefecture_id")
         commune_id = request.query_params.get("commune_id")
@@ -4009,8 +4811,7 @@ class EntEmploiDomAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -4052,7 +4853,7 @@ class EntEmploiDomAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             else:
                 where_clauses.append("geom IS NULL")
 
-        # Recherche texte (alignée sur la ListView)
+        # Recherche texte (alignÃ©e sur la ListView)
         if search:
             where_clauses.append(
                 "("
@@ -4073,7 +4874,7 @@ class EntEmploiDomAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
 
         with connection.cursor() as cursor:
             # ---- 1) Global au niveau entreprise ----
-            # On évite de compter plusieurs fois la même entreprise
+            # On Ã©vite de compter plusieurs fois la mÃªme entreprise
             cursor.execute(
                 f"""
                 SELECT
@@ -4114,6 +4915,19 @@ class EntEmploiDomAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             data["global_entreprises"] = {
                 "nb_entreprises": nb_entreprises,
                 "emplois_total": emplois_total,
+                "emplois_femmes": emplois_femmes,
+                "emplois_jeunes": emplois_jeunes,
+                "part_femmes_pct": part_femmes_pct,
+                "part_jeunes_pct": part_jeunes_pct,
+            }
+
+            # ClÃ© "global" pour compatibilitÃ© dashboard frontend
+            data["global"] = {
+                "nb_emplois_totaux": emplois_total,
+                "nb_emplois_femmes": emplois_femmes,
+                "nb_emplois_crees": emplois_total,
+                "nb_emplois_maintenus": 0,
+                "total_emplois": emplois_total,
                 "emplois_femmes": emplois_femmes,
                 "emplois_jeunes": emplois_jeunes,
                 "part_femmes_pct": part_femmes_pct,
@@ -4259,7 +5073,7 @@ class EntEmploiDomAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 )
             data["by_domaine"] = by_domaine
 
-            # ---- 4) Par région ----
+            # ---- 4) Par rÃ©gion ----
             cursor.execute(
                 f"""
                 SELECT
@@ -4329,7 +5143,7 @@ class EntEmploiDomAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 )
             data["by_region"] = by_region
 
-            # ---- 5) Région x domaine ----
+            # ---- 5) RÃ©gion x domaine ----
             cursor.execute(
                 f"""
                 SELECT
@@ -4409,7 +5223,7 @@ class EntEmploiDomAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 )
             data["by_region_and_domaine"] = by_region_and_domaine
 
-            # ---- 6) Par préfecture ----
+            # ---- 6) Par prÃ©fecture ----
             cursor.execute(
                 f"""
                 SELECT
@@ -4461,7 +5275,7 @@ class EntEmploiDomAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 for r in rows
             ]
 
-            # ---- 8) Par année / période de référence ----
+            # ---- 8) Par annÃ©e / pÃ©riode de rÃ©fÃ©rence ----
             cursor.execute(
                 f"""
                 SELECT
@@ -4500,7 +5314,7 @@ class EntEmploiDomAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
 class EntInsertionDomListView(CurrentProjectRequiredMixin, GenericAPIView):
     """
     Liste les insertions par domaine (marts.vw_ent_insertion_dom),
-    filtrées par projet actif via project_code (FIERE / AGRIECO).
+    filtrÃ©es par projet actif via project_code (FIERE / AGRIECO).
 
     Filtres possibles en query string :
     - ?search=...                 (raison_sociale, domaine_label, domaine_autre,
@@ -4514,8 +5328,8 @@ class EntInsertionDomListView(CurrentProjectRequiredMixin, GenericAPIView):
     - ?domaine_code=...          (code ref.domaine_emploi)
     - ?type_insertion_code=...   (code ref.type_insertion)
     - ?insertion_verte_dom=...   (valeur brute, ex. 'oui'/'non' ou bool)
-    - ?id_ent=...                (entreprise spécifique)
-    - ?has_geom=true|false       (présence de géométrie)
+    - ?id_ent=...                (entreprise spÃ©cifique)
+    - ?has_geom=true|false       (prÃ©sence de gÃ©omÃ©trie)
     """
 
     permission_classes = [IsAuthenticated]
@@ -4543,8 +5357,7 @@ class EntInsertionDomListView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -4577,7 +5390,7 @@ class EntInsertionDomListView(CurrentProjectRequiredMixin, GenericAPIView):
             params.append(type_insertion_code)
 
         if insertion_verte_dom:
-            # on prend la valeur telle quelle (bool/texte selon ton modèle)
+            # on prend la valeur telle quelle (bool/texte selon ton modÃ¨le)
             where_clauses.append("insertion_verte_dom = %s")
             params.append(insertion_verte_dom)
 
@@ -4646,7 +5459,7 @@ class EntInsertionDomListView(CurrentProjectRequiredMixin, GenericAPIView):
             )
             total = cursor.fetchone()[0]
 
-            # 2) Lignes paginées
+            # 2) Lignes paginÃ©es
             cursor.execute(
                 f"""
                 SELECT *
@@ -4685,10 +5498,10 @@ class EntInsertionDomListView(CurrentProjectRequiredMixin, GenericAPIView):
 
 class EntInsertionDomAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Agrégations sur les insertions par domaine (marts.vw_ent_insertion_dom),
-    filtrées par projet actif (FIERE / AGRIECO) et par territoire.
+    AgrÃ©gations sur les insertions par domaine (marts.vw_ent_insertion_dom),
+    filtrÃ©es par projet actif (FIERE / AGRIECO) et par territoire.
 
-    Filtres disponibles (alignés sur EntInsertionDomListView) :
+    Filtres disponibles (alignÃ©s sur EntInsertionDomListView) :
     - ?search=...
     - ?region_id=...
     - ?prefecture_id=...
@@ -4727,8 +5540,7 @@ class EntInsertionDomAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -4774,7 +5586,7 @@ class EntInsertionDomAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
             else:
                 where_clauses.append("geom IS NULL")
 
-        # Recherche texte (alignée sur la ListView)
+        # Recherche texte (alignÃ©e sur la ListView)
         if search:
             where_clauses.append(
                 "("
@@ -4846,6 +5658,75 @@ class EntInsertionDomAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
                 "part_jeunes_pct": part_jeunes_pct,
             }
 
+            cursor.execute(
+                f"""
+                SELECT
+                    COUNT(DISTINCT insertion_uuid) FILTER (
+                        WHERE duree_insertion_mois IS NOT NULL
+                    ) AS nb_insertions_datees,
+                    COUNT(DISTINCT insertion_uuid) FILTER (
+                        WHERE duree_insertion_mois <= 3
+                    ) AS nb_insertions_3m,
+                    COUNT(DISTINCT insertion_uuid) FILTER (
+                        WHERE duree_insertion_mois <= 6
+                    ) AS nb_insertions_6m,
+                    COUNT(DISTINCT insertion_uuid) FILTER (
+                        WHERE duree_insertion_mois <= 12
+                    ) AS nb_insertions_12m
+                FROM marts.vw_ent_insertion_dom
+                WHERE {where_sql}
+                """,
+                params,
+            )
+            delay_row = cursor.fetchone()
+            nb_insertions_datees = delay_row[0] or 0
+            nb_insertions_3m = delay_row[1] or 0
+            nb_insertions_6m = delay_row[2] or 0
+            nb_insertions_12m = delay_row[3] or 0
+            insertion_denominator = nb_insertions_datees or nb_insertions
+
+            # Cle "global" pour compatibilite dashboard frontend
+            data["global"] = {
+                "nb_insertions": nb_insertions,
+                "total_insertions": insert_total,
+                "insertion_3m": nb_insertions_3m,
+                "insertion_6m": nb_insertions_6m,
+                "insertion_12m": nb_insertions_12m,
+                "taux_insertion_3m": (
+                    round(100.0 * nb_insertions_3m / insertion_denominator, 2)
+                    if insertion_denominator > 0
+                    else None
+                ),
+                "taux_insertion_6m": (
+                    round(100.0 * nb_insertions_6m / insertion_denominator, 2)
+                    if insertion_denominator > 0
+                    else None
+                ),
+                "taux_insertion_12m": (
+                    round(100.0 * nb_insertions_12m / insertion_denominator, 2)
+                    if insertion_denominator > 0
+                    else None
+                ),
+                "taux_3m": (
+                    round(100.0 * nb_insertions_3m / insertion_denominator, 2)
+                    if insertion_denominator > 0
+                    else None
+                ),
+                "taux_6m": (
+                    round(100.0 * nb_insertions_6m / insertion_denominator, 2)
+                    if insertion_denominator > 0
+                    else None
+                ),
+                "taux_12m": (
+                    round(100.0 * nb_insertions_12m / insertion_denominator, 2)
+                    if insertion_denominator > 0
+                    else None
+                ),
+                "insert_femmes": insert_femmes,
+                "insert_jeunes": insert_jeunes,
+                "part_femmes_pct": part_femmes_pct,
+                "part_jeunes_pct": part_jeunes_pct,
+            }
             # ---- 2) Global au niveau domaines d'insertion ----
             cursor.execute(
                 f"""
@@ -4912,7 +5793,7 @@ class EntInsertionDomAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
                 "part_verts_dom_pct": part_verts_dom_pct,
             }
 
-            # ---- 3) Statistiques de durée d'insertion ----
+            # ---- 3) Statistiques de durÃ©e d'insertion ----
             cursor.execute(
                 f"""
                 SELECT
@@ -5091,7 +5972,7 @@ class EntInsertionDomAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
                 )
             data["by_type_insertion"] = by_type_insertion
 
-            # ---- 6) Par région ----
+            # ---- 6) Par rÃ©gion ----
             cursor.execute(
                 f"""
                 SELECT
@@ -5164,7 +6045,7 @@ class EntInsertionDomAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
                 )
             data["by_region"] = by_region
 
-            # ---- 7) Région x domaine ----
+            # ---- 7) RÃ©gion x domaine ----
             cursor.execute(
                 f"""
                 SELECT
@@ -5247,7 +6128,7 @@ class EntInsertionDomAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
                 )
             data["by_region_and_domaine"] = by_region_and_domaine
 
-            # ---- 8) Par préfecture ----
+            # ---- 8) Par prÃ©fecture ----
             cursor.execute(
                 f"""
                 SELECT
@@ -5303,7 +6184,7 @@ class EntInsertionDomAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
                 for r in rows
             ]
 
-            # ---- 10) Par année / période de référence ----
+            # ---- 10) Par annÃ©e / pÃ©riode de rÃ©fÃ©rence ----
             cursor.execute(
                 f"""
                 SELECT
@@ -5344,7 +6225,7 @@ class EntInsertionDomAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
 class FiereSuiviSortantListView(CurrentProjectRequiredMixin, GenericAPIView):
     """
     Liste le suivi des sortants FIERE (marts.vw_fiere_suivi_sortant),
-    filtré par projet actif via project_code (FIERE / AGRIECO).
+    filtrÃ© par projet actif via project_code (FIERE / AGRIECO).
 
     Filtres possibles en query string :
     - ?search=...                 (nom_sortant, intitule_formation,
@@ -5365,7 +6246,7 @@ class FiereSuiviSortantListView(CurrentProjectRequiredMixin, GenericAPIView):
     - ?satisfaction_insertion=... (code ref.satisfaction_globale)
     - ?id_sortant=...
     - ?id_formation=...
-    - ?has_geom=true|false        (présence de géométrie)
+    - ?has_geom=true|false        (prÃ©sence de gÃ©omÃ©trie)
     """
 
     permission_classes = [IsAuthenticated]
@@ -5376,7 +6257,7 @@ class FiereSuiviSortantListView(CurrentProjectRequiredMixin, GenericAPIView):
         if error_response is not None:
             return error_response
 
-        project_code = project.code_fonc  # FIERE en pratique, mais on garde générique
+        project_code = project.code_fonc  # FIERE en pratique, mais on garde gÃ©nÃ©rique
 
         # -------- Filtres --------
         region_id = request.query_params.get("region_id")
@@ -5399,8 +6280,7 @@ class FiereSuiviSortantListView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -5415,7 +6295,7 @@ class FiereSuiviSortantListView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Caractéristiques formation / sortant / insertion
+        # CaractÃ©ristiques formation / sortant / insertion
         if filiere_principale:
             where_clauses.append("filiere_principale = %s")
             params.append(filiere_principale)
@@ -5524,7 +6404,7 @@ class FiereSuiviSortantListView(CurrentProjectRequiredMixin, GenericAPIView):
             )
             total = cursor.fetchone()[0]
 
-            # 2) Lignes paginées
+            # 2) Lignes paginÃ©es
             cursor.execute(
                 f"""
                 SELECT *
@@ -5561,10 +6441,10 @@ class FiereSuiviSortantListView(CurrentProjectRequiredMixin, GenericAPIView):
 
 class FiereSuiviSortantAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Agrégations sur le suivi des sortants FIERE (marts.vw_fiere_suivi_sortant),
-    filtrées par projet actif (FIERE / AGRIECO) et par territoire.
+    AgrÃ©gations sur le suivi des sortants FIERE (marts.vw_fiere_suivi_sortant),
+    filtrÃ©es par projet actif (FIERE / AGRIECO) et par territoire.
 
-    Filtres disponibles (alignés sur FiereSuiviSortantListView) :
+    Filtres disponibles (alignÃ©s sur FiereSuiviSortantListView) :
     - ?search=...
     - ?region_id=...
     - ?prefecture_id=...
@@ -5613,8 +6493,7 @@ class FiereSuiviSortantAggregatesView(CurrentProjectRequiredMixin, GenericAPIVie
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -5629,7 +6508,7 @@ class FiereSuiviSortantAggregatesView(CurrentProjectRequiredMixin, GenericAPIVie
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Caractéristiques formation / sortant / insertion
+        # CaractÃ©ristiques formation / sortant / insertion
         if filiere_principale:
             where_clauses.append("filiere_principale = %s")
             params.append(filiere_principale)
@@ -5680,7 +6559,7 @@ class FiereSuiviSortantAggregatesView(CurrentProjectRequiredMixin, GenericAPIVie
             else:
                 where_clauses.append("geom IS NULL")
 
-        # Recherche texte (alignée sur la ListView)
+        # Recherche texte (alignÃ©e sur la ListView)
         if search:
             where_clauses.append(
                 "("
@@ -5700,7 +6579,7 @@ class FiereSuiviSortantAggregatesView(CurrentProjectRequiredMixin, GenericAPIVie
 
         where_sql = " AND ".join(where_clauses)
 
-        # Conditions "inséré" / "PVH" réutilisables
+        # Conditions "insÃ©rÃ©" / "PVH" rÃ©utilisables
         INSERE_COND = """
         (
             insere::text IN ('true','t','1')
@@ -5730,6 +6609,10 @@ class FiereSuiviSortantAggregatesView(CurrentProjectRequiredMixin, GenericAPIVie
                         ELSE NULL
                     END) AS nb_sortants_non_inseres,
                     COUNT(DISTINCT CASE WHEN {PVH_COND} THEN id_sortant END) AS nb_sortants_pvh,
+                    COUNT(DISTINCT CASE
+                        WHEN sexe ILIKE 'F%%' OR sexe ILIKE 'femme%%' OR sexe_label ILIKE 'femme%%'
+                        THEN id_sortant
+                    END) AS nb_sortants_femmes,
                     AVG(age)::numeric AS age_moyen,
                     MIN(age) AS age_min,
                     MAX(age) AS age_max,
@@ -5747,13 +6630,14 @@ class FiereSuiviSortantAggregatesView(CurrentProjectRequiredMixin, GenericAPIVie
             nb_sortants_inseres = row[2] or 0
             nb_sortants_non_inseres = row[3] or 0
             nb_sortants_pvh = row[4] or 0
+            nb_sortants_femmes = row[5] or 0
 
-            age_moyen = float(row[5]) if row[5] is not None else None
-            age_min = row[6]
-            age_max = row[7]
-            revenu_moyen = float(row[8]) if row[8] is not None else None
-            revenu_min = row[9]
-            revenu_max = row[10]
+            age_moyen = float(row[6]) if row[6] is not None else None
+            age_min = row[7]
+            age_max = row[8]
+            revenu_moyen = float(row[9]) if row[9] is not None else None
+            revenu_min = row[10]
+            revenu_max = row[11]
 
             taux_insertion = (
                 round(100.0 * nb_sortants_inseres / nb_sortants, 2)
@@ -5767,7 +6651,10 @@ class FiereSuiviSortantAggregatesView(CurrentProjectRequiredMixin, GenericAPIVie
                 "nb_sortants_inseres": nb_sortants_inseres,
                 "nb_sortants_non_inseres": nb_sortants_non_inseres,
                 "nb_sortants_pvh": nb_sortants_pvh,
+                "nb_sortants_femmes": nb_sortants_femmes,
+                "nb_femmes": nb_sortants_femmes,
                 "taux_insertion_pct": taux_insertion,
+                "taux_achevement_pct": None,
                 "age_moyen": age_moyen,
                 "age_min": age_min,
                 "age_max": age_max,
@@ -5817,7 +6704,7 @@ class FiereSuiviSortantAggregatesView(CurrentProjectRequiredMixin, GenericAPIVie
                 )
             data["by_sexe"] = by_sexe
 
-            # ---- 3) Par région ----
+            # ---- 3) Par rÃ©gion ----
             cursor.execute(
                 f"""
                 SELECT
@@ -5865,7 +6752,7 @@ class FiereSuiviSortantAggregatesView(CurrentProjectRequiredMixin, GenericAPIVie
                 )
             data["by_region"] = by_region
 
-            # ---- 4) Région x sexe ----
+            # ---- 4) RÃ©gion x sexe ----
             cursor.execute(
                 f"""
                 SELECT
@@ -5906,7 +6793,7 @@ class FiereSuiviSortantAggregatesView(CurrentProjectRequiredMixin, GenericAPIVie
                 )
             data["by_region_and_sexe"] = by_region_and_sexe
 
-            # ---- 5) Par filière de formation ----
+            # ---- 5) Par filiÃ¨re de formation ----
             cursor.execute(
                 f"""
                 SELECT
@@ -5940,6 +6827,7 @@ class FiereSuiviSortantAggregatesView(CurrentProjectRequiredMixin, GenericAPIVie
                     }
                 )
             data["by_filiere_formation"] = by_filiere
+            data["by_filiere"] = by_filiere  # alias dashboard
 
             # ---- 6) Par domaine de formation ----
             cursor.execute(
@@ -6086,7 +6974,7 @@ class FiereSuiviSortantAggregatesView(CurrentProjectRequiredMixin, GenericAPIVie
                 )
             data["by_satisfaction"] = by_satisfaction
 
-            # ---- 10) Par période de suivi ----
+            # ---- 10) Par pÃ©riode de suivi ----
             cursor.execute(
                 f"""
                 SELECT
@@ -6133,8 +7021,8 @@ class FiereSuiviSortantAggregatesView(CurrentProjectRequiredMixin, GenericAPIVie
 
 class FormationEcoCatListView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Liste les formations économiques avec détail par catégorie de participants
-    (marts.vw_formation_eco_cat), filtrées par projet actif (FIERE / AGRIECO).
+    Liste les formations Ã©conomiques avec dÃ©tail par catÃ©gorie de participants
+    (marts.vw_formation_eco_cat), filtrÃ©es par projet actif (FIERE / AGRIECO).
 
     Filtres possibles en query string :
     - ?search=...                   (intitule_formation, organisme_formateur,
@@ -6149,10 +7037,10 @@ class FormationEcoCatListView(CurrentProjectRequiredMixin, GenericAPIView):
     - ?modalite_formation=...       (code ref.modalite_formation)
     - ?categorie_code=...           (code ref.categorie_participant)
     - ?formation_liee_ent=...       (valeur brute, ex. true/false ou 'oui'/'non')
-    - ?id_ent=...                   (formation liée à une entreprise)
+    - ?id_ent=...                   (formation liÃ©e Ã  une entreprise)
     - ?date_debut_from=YYYY-MM-DD
     - ?date_debut_to=YYYY-MM-DD
-    - ?has_geom=true|false          (présence de géométrie)
+    - ?has_geom=true|false          (prÃ©sence de gÃ©omÃ©trie)
     """
 
     permission_classes = [IsAuthenticated]
@@ -6185,8 +7073,7 @@ class FormationEcoCatListView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -6201,7 +7088,7 @@ class FormationEcoCatListView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Caractéristiques formation
+        # CaractÃ©ristiques formation
         if filiere_principale:
             where_clauses.append("filiere_principale = %s")
             params.append(filiere_principale)
@@ -6223,7 +7110,7 @@ class FormationEcoCatListView(CurrentProjectRequiredMixin, GenericAPIView):
             params.append(categorie_code)
 
         if formation_liee_ent:
-            # on filtre tel quel (bool ou texte selon ton modèle)
+            # on filtre tel quel (bool ou texte selon ton modÃ¨le)
             where_clauses.append("formation_liee_ent = %s")
             params.append(formation_liee_ent)
 
@@ -6231,7 +7118,7 @@ class FormationEcoCatListView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_ent = %s")
             params.append(id_ent)
 
-        # Dates (on considère date_debut comme référence)
+        # Dates (on considÃ¨re date_debut comme rÃ©fÃ©rence)
         if date_debut_from:
             where_clauses.append("date_debut >= %s")
             params.append(date_debut_from)
@@ -6301,7 +7188,7 @@ class FormationEcoCatListView(CurrentProjectRequiredMixin, GenericAPIView):
             )
             total = cursor.fetchone()[0]
 
-            # 2) Lignes paginées
+            # 2) Lignes paginÃ©es
             cursor.execute(
                 f"""
                 SELECT *
@@ -6339,10 +7226,10 @@ class FormationEcoCatListView(CurrentProjectRequiredMixin, GenericAPIView):
 
 class FormationEcoCatAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Agrégations sur les formations économiques (marts.vw_formation_eco_cat),
-    filtrées par projet actif (FIERE / AGRIECO) + territoire et caractéristiques.
+    AgrÃ©gations sur les formations Ã©conomiques (marts.vw_formation_eco_cat),
+    filtrÃ©es par projet actif (FIERE / AGRIECO) + territoire et caractÃ©ristiques.
 
-    Même jeux de filtres que FormationEcoCatListView :
+    MÃªme jeux de filtres que FormationEcoCatListView :
     - ?search=...
     - ?region_id=...
     - ?prefecture_id=...
@@ -6368,7 +7255,7 @@ class FormationEcoCatAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
 
         project_code = project.code_fonc
 
-        # -------- Filtres (même que ListView) --------
+        # -------- Filtres (mÃªme que ListView) --------
         region_id = request.query_params.get("region_id")
         prefecture_id = request.query_params.get("prefecture_id")
         commune_id = request.query_params.get("commune_id")
@@ -6388,8 +7275,7 @@ class FormationEcoCatAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -6404,7 +7290,7 @@ class FormationEcoCatAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Caractéristiques formation
+        # CaractÃ©ristiques formation
         if filiere_principale:
             where_clauses.append("filiere_principale = %s")
             params.append(filiere_principale)
@@ -6469,7 +7355,7 @@ class FormationEcoCatAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
         data: dict = {}
 
         with connection.cursor() as cursor:
-            # ==== 1) GLOBAL : formation-level (CTE base) + catégorie-level ====
+            # ==== 1) GLOBAL : formation-level (CTE base) + catÃ©gorie-level ====
             cursor.execute(
                 f"""
                 WITH base AS (
@@ -6526,7 +7412,7 @@ class FormationEcoCatAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
             participants_acheve = row[6] or 0
             duree_moyenne_jours = float(row[7]) if row[7] is not None else None
 
-            # Catégorie-level pour avoir un total robuste côté catégories
+            # CatÃ©gorie-level pour avoir un total robuste cÃ´tÃ© catÃ©gories
             cursor.execute(
                 f"""
                 SELECT
@@ -6543,7 +7429,7 @@ class FormationEcoCatAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
             nb_part_fem_cat_total = cat_row[1] or 0
             nb_part_jeunes_cat_total = cat_row[2] or 0
 
-            # taux / parts (on privilégie le total catégorie pour les ratios)
+            # taux / parts (on privilÃ©gie le total catÃ©gorie pour les ratios)
             part_femmes_pct = (
                 round(100.0 * nb_part_fem_cat_total / nb_part_cat_total, 2)
                 if nb_part_cat_total > 0
@@ -6568,6 +7454,8 @@ class FormationEcoCatAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
             data["global"] = {
                 "nb_formations": nb_formations,
                 "participants_total": participants_total,
+                "nb_participants": participants_total,       # alias front
+                "total_participants": participants_total,     # alias front
                 "participants_femmes": participants_femmes,
                 "participants_jeunes": participants_jeunes,
                 "participants_pvh": participants_pvh,
@@ -6583,7 +7471,7 @@ class FormationEcoCatAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
                 "taux_achevement_global_pct": taux_achevement_global,
             }
 
-            # ==== 2) Par région (formation-level) ====
+            # ==== 2) Par rÃ©gion (formation-level) ====
             cursor.execute(
                 f"""
                 WITH base AS (
@@ -6644,7 +7532,7 @@ class FormationEcoCatAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
                 )
             data["by_region"] = by_region
 
-            # ==== 3) Par filière principale (secteur éco) ====
+            # ==== 3) Par filiÃ¨re principale (secteur Ã©co) ====
             cursor.execute(
                 f"""
                 WITH base AS (
@@ -6803,7 +7691,7 @@ class FormationEcoCatAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
                 )
             data["by_type_formation"] = by_type
 
-            # ==== 6) Par modalité de formation ====
+            # ==== 6) Par modalitÃ© de formation ====
             cursor.execute(
                 f"""
                 WITH base AS (
@@ -6852,7 +7740,7 @@ class FormationEcoCatAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
                 )
             data["by_modalite_formation"] = by_modalite
 
-            # ==== 7) Par catégorie de participant (cat-level) ====
+            # ==== 7) Par catÃ©gorie de participant (cat-level) ====
             cursor.execute(
                 f"""
                 SELECT
@@ -6906,8 +7794,9 @@ class FormationEcoCatAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
                     }
                 )
             data["by_categorie_participant"] = by_categorie
+            data["by_categorie"] = by_categorie  # alias dashboard
 
-            # ==== 8) Par année de début ====
+            # ==== 8) Par annÃ©e de dÃ©but ====
             cursor.execute(
                 f"""
                 WITH base AS (
@@ -6961,7 +7850,7 @@ class FormationEcoCatAggregatesView(CurrentProjectRequiredMixin, GenericAPIView)
 class IntrantDistributionListView(CurrentProjectRequiredMixin, GenericAPIView):
     """
     Liste les distributions d'intrants (marts.vw_intrant_distribution),
-    filtrées par projet actif via project_code (FIERE / AGRIECO).
+    filtrÃ©es par projet actif via project_code (FIERE / AGRIECO).
 
     Filtres possibles en query string :
     - ?search=...                 (localite, filiere_label, intrant_autres,
@@ -6975,7 +7864,7 @@ class IntrantDistributionListView(CurrentProjectRequiredMixin, GenericAPIView):
     - ?campagne_yyyy=2023
     - ?source_intrant=...
     - ?intrant_conforme=...      (valeur brute du champ, ex. 'oui'/'non' ou bool)
-    - ?has_geom=true|false       (présence de géométrie)
+    - ?has_geom=true|false       (prÃ©sence de gÃ©omÃ©trie)
     """
 
     permission_classes = [IsAuthenticated]
@@ -7002,8 +7891,7 @@ class IntrantDistributionListView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -7018,7 +7906,7 @@ class IntrantDistributionListView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Caractéristiques de la distribution
+        # CaractÃ©ristiques de la distribution
         if filiere:
             where_clauses.append("filiere = %s")
             params.append(filiere)
@@ -7036,7 +7924,7 @@ class IntrantDistributionListView(CurrentProjectRequiredMixin, GenericAPIView):
             params.append(source_intrant)
 
         if intrant_conforme:
-            # on filtre tel quel (bool ou texte selon ton modèle)
+            # on filtre tel quel (bool ou texte selon ton modÃ¨le)
             where_clauses.append("intrant_conforme = %s")
             params.append(intrant_conforme)
 
@@ -7101,7 +7989,7 @@ class IntrantDistributionListView(CurrentProjectRequiredMixin, GenericAPIView):
             )
             total = cursor.fetchone()[0]
 
-            # 2) Lignes paginées
+            # 2) Lignes paginÃ©es
             cursor.execute(
                 f"""
                 SELECT *
@@ -7140,10 +8028,10 @@ class IntrantDistributionListView(CurrentProjectRequiredMixin, GenericAPIView):
 
 class IntrantDistributionAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Agrégations sur les distributions d'intrants (marts.vw_intrant_distribution),
-    filtrées par projet actif via project_code (FIERE / AGRIECO) + territoire et caractéristiques.
+    AgrÃ©gations sur les distributions d'intrants (marts.vw_intrant_distribution),
+    filtrÃ©es par projet actif via project_code (FIERE / AGRIECO) + territoire et caractÃ©ristiques.
 
-    Filtres possibles en query string (mêmes que IntrantDistributionListView) :
+    Filtres possibles en query string (mÃªmes que IntrantDistributionListView) :
     - ?search=...
     - ?region_id=...
     - ?prefecture_id=...
@@ -7179,8 +8067,7 @@ class IntrantDistributionAggregatesView(CurrentProjectRequiredMixin, GenericAPIV
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -7195,7 +8082,7 @@ class IntrantDistributionAggregatesView(CurrentProjectRequiredMixin, GenericAPIV
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Caractéristiques de la distribution
+        # CaractÃ©ristiques de la distribution
         if filiere:
             where_clauses.append("filiere = %s")
             params.append(filiere)
@@ -7258,7 +8145,7 @@ class IntrantDistributionAggregatesView(CurrentProjectRequiredMixin, GenericAPIV
             nb_distributions = row[0] or 0
             menages_total = row[1] or 0
 
-            # Quantités globales par unité
+            # QuantitÃ©s globales par unitÃ©
             cursor.execute(
                 f"""
                 SELECT
@@ -7288,12 +8175,12 @@ class IntrantDistributionAggregatesView(CurrentProjectRequiredMixin, GenericAPIV
             data["global"] = {
                 "nb_distributions": nb_distributions,
                 "menages_beneficiaires_total": menages_total,
-                # Attention : somme brute toutes unités confondues (indicatif)
+                # Attention : somme brute toutes unitÃ©s confondues (indicatif)
                 "quantite_totale_brute": quantite_totale_brute,
                 "quantites_par_unite": quantites_par_unite,
             }
 
-            # ==== 2) Par conformité ====
+            # ==== 2) Par conformitÃ© ====
             cursor.execute(
                 f"""
                 SELECT
@@ -7334,7 +8221,7 @@ class IntrantDistributionAggregatesView(CurrentProjectRequiredMixin, GenericAPIV
                 )
             data["by_conformite"] = by_conformite
 
-            # ==== 3) Par région ====
+            # ==== 3) Par rÃ©gion ====
             cursor.execute(
                 f"""
                 SELECT
@@ -7383,7 +8270,7 @@ class IntrantDistributionAggregatesView(CurrentProjectRequiredMixin, GenericAPIV
                 )
             data["by_region"] = by_region
 
-            # ==== 4) Par filière ====
+            # ==== 4) Par filiÃ¨re ====
             cursor.execute(
                 f"""
                 SELECT
@@ -7469,9 +8356,11 @@ class IntrantDistributionAggregatesView(CurrentProjectRequiredMixin, GenericAPIV
                 by_type_intrant.append(
                     {
                         "type_intrant": type_i,
+                        "type_intrant_label": type_i,           # alias front (pas de label dispo)
                         "nb_distributions": nb,
                         "menages_beneficiaires_total": menages,
                         "quantite_totale_brute": qte,
+                        "quantite_totale": qte,                 # alias front
                         "part_distributions_pct": part_distributions,
                         "part_menages_beneficiaires_pct": part_menages,
                     }
@@ -7575,13 +8464,13 @@ class IntrantDistributionAggregatesView(CurrentProjectRequiredMixin, GenericAPIV
 
 
 # -----------------------------------------------------------------------------
-# Liste des marchés
+# Liste des marchÃ©s
 # -----------------------------------------------------------------------------
 
 class MarcheListView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Liste des marchés / comptoirs (marts.vw_marche),
-    filtrés par projet actif via project_code (FIERE / AGRIECO).
+    Liste des marchÃ©s / comptoirs (marts.vw_marche),
+    filtrÃ©s par projet actif via project_code (FIERE / AGRIECO).
 
     Filtres possibles en query string :
     - ?search=...                (localite, filiere_label, gestionnaire,
@@ -7594,7 +8483,7 @@ class MarcheListView(CurrentProjectRequiredMixin, GenericAPIView):
     - ?frequence_marche=...     (valeur brute du champ frequence_marche)
     - ?gestionnaire=...         (valeur brute du champ gestionnaire)
     - ?is_active=true|false
-    - ?has_geom=true|false      (présence de géométrie)
+    - ?has_geom=true|false      (prÃ©sence de gÃ©omÃ©trie)
     """
 
     permission_classes = [IsAuthenticated]
@@ -7621,8 +8510,7 @@ class MarcheListView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -7637,7 +8525,7 @@ class MarcheListView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Caractéristiques du marché
+        # CaractÃ©ristiques du marchÃ©
         if filiere:
             where_clauses.append("filiere = %s")
             params.append(filiere)
@@ -7655,8 +8543,7 @@ class MarcheListView(CurrentProjectRequiredMixin, GenericAPIView):
             params.append(gestionnaire)
 
         if is_active in ("true", "false"):
-            where_clauses.append("is_active = %s")
-            params.append(is_active == "true")
+            where_clauses.append(sql_bool("is_active", is_active == "true"))
 
         if has_geom in ("true", "false"):
             if has_geom == "true":
@@ -7718,7 +8605,7 @@ class MarcheListView(CurrentProjectRequiredMixin, GenericAPIView):
             )
             total = cursor.fetchone()[0]
 
-            # 2) Lignes paginées
+            # 2) Lignes paginÃ©es
             cursor.execute(
                 f"""
                 SELECT *
@@ -7757,10 +8644,10 @@ class MarcheListView(CurrentProjectRequiredMixin, GenericAPIView):
 
 class MarcheAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Agrégations sur les marchés / comptoirs (marts.vw_marche),
-    filtrés par projet actif via project_code (FIERE / AGRIECO).
+    AgrÃ©gations sur les marchÃ©s / comptoirs (marts.vw_marche),
+    filtrÃ©s par projet actif via project_code (FIERE / AGRIECO).
 
-    Filtres possibles en query string (identiques à MarcheListView) :
+    Filtres possibles en query string (identiques Ã  MarcheListView) :
     - ?search=...
     - ?region_id=...
     - ?prefecture_id=...
@@ -7796,8 +8683,7 @@ class MarcheAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -7812,7 +8698,7 @@ class MarcheAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Caractéristiques du marché
+        # CaractÃ©ristiques du marchÃ©
         if filiere:
             where_clauses.append("filiere = %s")
             params.append(filiere)
@@ -7830,8 +8716,8 @@ class MarcheAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             params.append(gestionnaire)
 
         if is_active in ("true", "false"):
-            where_clauses.append("is_active = %s")
-            params.append(is_active == "true")
+            where_clauses.append(sql_bool("is_active", is_active == "true"))
+
 
         if has_geom in ("true", "false"):
             if has_geom == "true":
@@ -7863,7 +8749,7 @@ class MarcheAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 f"""
                 SELECT
                     COUNT(*) AS nb_marches_total,
-                    COUNT(*) FILTER (WHERE is_active = TRUE) AS nb_marches_actifs,
+                    COUNT(*) FILTER (WHERE {sql_true("is_active")}) AS nb_marches_actifs,
                     COUNT(*) FILTER (WHERE geom IS NOT NULL) AS nb_marches_geoloc
                 FROM marts.vw_marche
                 WHERE {where_sql}
@@ -7887,14 +8773,14 @@ class MarcheAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 ),
             }
 
-            # ==== 2) Par région ====
+            # ==== 2) Par rÃ©gion ====
             cursor.execute(
                 f"""
                 SELECT
                     id_region,
                     region_nom,
                     COUNT(*) AS nb_marches,
-                    COUNT(*) FILTER (WHERE is_active = TRUE) AS nb_marches_actifs,
+                    COUNT(*) FILTER (WHERE {sql_true("is_active")}) AS nb_marches_actifs,
                     COUNT(*) FILTER (WHERE geom IS NOT NULL) AS nb_marches_geoloc
                 FROM marts.vw_marche
                 WHERE {where_sql}
@@ -7937,7 +8823,7 @@ class MarcheAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                     id_region,
                     region_nom,
                     COUNT(*) AS nb_marches,
-                    COUNT(*) FILTER (WHERE is_active = TRUE) AS nb_marches_actifs,
+                    COUNT(*) FILTER (WHERE {sql_true("is_active")}) AS nb_marches_actifs,
                     COUNT(*) FILTER (WHERE geom IS NOT NULL) AS nb_marches_geoloc
                 FROM marts.vw_marche
                 WHERE {where_sql}
@@ -7975,14 +8861,14 @@ class MarcheAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 )
             data["by_commune"] = by_commune
 
-            # ==== 4) Par filière ====
+            # ==== 4) Par filiÃ¨re ====
             cursor.execute(
                 f"""
                 SELECT
                     filiere,
                     filiere_label,
                     COUNT(*) AS nb_marches,
-                    COUNT(*) FILTER (WHERE is_active = TRUE) AS nb_marches_actifs,
+                    COUNT(*) FILTER (WHERE {sql_true("is_active")}) AS nb_marches_actifs,
                     COUNT(*) FILTER (WHERE geom IS NOT NULL) AS nb_marches_geoloc
                 FROM marts.vw_marche
                 WHERE {where_sql}
@@ -8022,7 +8908,7 @@ class MarcheAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 SELECT
                     type_comptoir,
                     COUNT(*) AS nb_marches,
-                    COUNT(*) FILTER (WHERE is_active = TRUE) AS nb_marches_actifs,
+                    COUNT(*) FILTER (WHERE {sql_true("is_active")}) AS nb_marches_actifs,
                     COUNT(*) FILTER (WHERE geom IS NOT NULL) AS nb_marches_geoloc
                 FROM marts.vw_marche
                 WHERE {where_sql}
@@ -8054,13 +8940,13 @@ class MarcheAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 )
             data["by_type_comptoir"] = by_type_comptoir
 
-            # ==== 6) Par fréquence de marché ====
+            # ==== 6) Par frÃ©quence de marchÃ© ====
             cursor.execute(
                 f"""
                 SELECT
                     frequence_marche,
                     COUNT(*) AS nb_marches,
-                    COUNT(*) FILTER (WHERE is_active = TRUE) AS nb_marches_actifs,
+                    COUNT(*) FILTER (WHERE {sql_true("is_active")}) AS nb_marches_actifs,
                     COUNT(*) FILTER (WHERE geom IS NOT NULL) AS nb_marches_geoloc
                 FROM marts.vw_marche
                 WHERE {where_sql}
@@ -8098,7 +8984,7 @@ class MarcheAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 SELECT
                     gestionnaire,
                     COUNT(*) AS nb_marches,
-                    COUNT(*) FILTER (WHERE is_active = TRUE) AS nb_marches_actifs,
+                    COUNT(*) FILTER (WHERE {sql_true("is_active")}) AS nb_marches_actifs,
                     COUNT(*) FILTER (WHERE geom IS NOT NULL) AS nb_marches_geoloc
                 FROM marts.vw_marche
                 WHERE {where_sql}
@@ -8134,12 +9020,12 @@ class MarcheAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
 
 
 # -----------------------------------------------------------------------------
-# Liste des météo mesure
+# Liste des mÃ©tÃ©o mesure
 # -----------------------------------------------------------------------------
 
 class MeteoMesureListView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Mesures météo (marts.vw_meteo_mesure), filtrées par projet actif.
+    Mesures mÃ©tÃ©o (marts.vw_meteo_mesure), filtrÃ©es par projet actif.
 
     Filtres possibles en query string :
     - ?search=...              (nom_station, localite, obs_pluie,
@@ -8182,8 +9068,7 @@ class MeteoMesureListView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -8220,8 +9105,8 @@ class MeteoMesureListView(CurrentProjectRequiredMixin, GenericAPIView):
             params.append(date_obs_to)
 
         if is_active in ("true", "false"):
-            where_clauses.append("is_active = %s")
-            params.append(is_active == "true")
+            where_clauses.append(sql_bool("is_active", is_active == "true"))
+
 
         if has_geom in ("true", "false"):
             if has_geom == "true":
@@ -8282,7 +9167,7 @@ class MeteoMesureListView(CurrentProjectRequiredMixin, GenericAPIView):
             )
             total = cursor.fetchone()[0]
 
-            # 2) Lignes paginées
+            # 2) Lignes paginÃ©es
             cursor.execute(
                 f"""
                 SELECT *
@@ -8320,10 +9205,10 @@ class MeteoMesureListView(CurrentProjectRequiredMixin, GenericAPIView):
 
 class MeteoMesureAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Agrégations sur les mesures météo (marts.vw_meteo_mesure),
-    filtrées par projet actif via project_code (FIERE / AGRIECO).
+    AgrÃ©gations sur les mesures mÃ©tÃ©o (marts.vw_meteo_mesure),
+    filtrÃ©es par projet actif via project_code (FIERE / AGRIECO).
 
-    Filtres possibles en query string (identiques à MeteoMesureListView) :
+    Filtres possibles en query string (identiques Ã  MeteoMesureListView) :
     - ?search=...
     - ?region_id=...
     - ?prefecture_id=...
@@ -8362,8 +9247,7 @@ class MeteoMesureAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -8400,10 +9284,10 @@ class MeteoMesureAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("date_obs <= %s")
             params.append(date_obs_to)
 
-        # Statut / géométrie
+        # Statut / gÃ©omÃ©trie
         if is_active in ("true", "false"):
-            where_clauses.append("is_active = %s")
-            params.append(is_active == "true")
+            where_clauses.append(sql_bool("is_active", is_active == "true"))
+
 
         if has_geom in ("true", "false"):
             if has_geom == "true":
@@ -8456,7 +9340,7 @@ class MeteoMesureAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 "tmax_moy": float(row[5]) if row[5] is not None else None,
             }
 
-            # ==== 2) Par région ====
+            # ==== 2) Par rÃ©gion ====
             cursor.execute(
                 f"""
                 SELECT
@@ -8622,7 +9506,7 @@ class MeteoMesureAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 )
             data["by_statut_station"] = by_statut_station
 
-            # ✅ ==== 7) Par mois (pour le line chart pluie mensuelle) ====
+            # âœ… ==== 7) Par mois (pour le line chart pluie mensuelle) ====
             cursor.execute(
                 f"""
                 SELECT
@@ -8654,13 +9538,13 @@ class MeteoMesureAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
 
 
 # -----------------------------------------------------------------------------
-# Liste des météo station
+# Liste des mÃ©tÃ©o station
 # -----------------------------------------------------------------------------
 
 class MeteoStationListView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Liste des stations météo (marts.vw_meteo_station),
-    filtrées par projet actif (project_code).
+    Liste des stations mÃ©tÃ©o (marts.vw_meteo_station),
+    filtrÃ©es par projet actif (project_code).
 
     Filtres possibles en query string :
     - ?search=...                (nom_station, localite, obs_station,
@@ -8711,8 +9595,7 @@ class MeteoStationListView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -8727,7 +9610,7 @@ class MeteoStationListView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Caractéristiques station
+        # CaractÃ©ristiques station
         if code_station:
             where_clauses.append("code_station = %s")
             params.append(code_station)
@@ -8766,8 +9649,8 @@ class MeteoStationListView(CurrentProjectRequiredMixin, GenericAPIView):
             params.append(date_mise_service_to)
 
         if is_active in ("true", "false"):
-            where_clauses.append("is_active = %s")
-            params.append(is_active == "true")
+            where_clauses.append(sql_bool("is_active", is_active == "true"))
+
 
         if has_geom in ("true", "false"):
             if has_geom == "true":
@@ -8829,7 +9712,7 @@ class MeteoStationListView(CurrentProjectRequiredMixin, GenericAPIView):
             )
             total = cursor.fetchone()[0]
 
-            # 2) Lignes paginées
+            # 2) Lignes paginÃ©es
             cursor.execute(
                 f"""
                 SELECT *
@@ -8867,10 +9750,10 @@ class MeteoStationListView(CurrentProjectRequiredMixin, GenericAPIView):
 
 class MeteoStationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Agrégations sur les stations météo (marts.vw_meteo_station),
-    filtrées par projet actif via project_code (FIERE / AGRIECO).
+    AgrÃ©gations sur les stations mÃ©tÃ©o (marts.vw_meteo_station),
+    filtrÃ©es par projet actif via project_code (FIERE / AGRIECO).
 
-    Filtres possibles en query string (identiques à MeteoStationListView) :
+    Filtres possibles en query string (identiques Ã  MeteoStationListView) :
     - ?search=...
     - ?region_id=...
     - ?prefecture_id=...
@@ -8918,8 +9801,7 @@ class MeteoStationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -8934,7 +9816,7 @@ class MeteoStationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Caractéristiques
+        # CaractÃ©ristiques
         if code_station:
             where_clauses.append("code_station = %s")
             params.append(code_station)
@@ -8973,8 +9855,8 @@ class MeteoStationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             params.append(date_mise_service_to)
 
         if is_active in ("true", "false"):
-            where_clauses.append("is_active = %s")
-            params.append(is_active == "true")
+            where_clauses.append(sql_bool("is_active", is_active == "true"))
+
 
         if has_geom in ("true", "false"):
             if has_geom == "true":
@@ -9033,7 +9915,7 @@ class MeteoStationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 "derniere_mise_service": derniere_mise_service,
             }
 
-            # ==== 2) Par région ====
+            # ==== 2) Par rÃ©gion ====
             cursor.execute(
                 f"""
                 SELECT
@@ -9105,7 +9987,7 @@ class MeteoStationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 )
             data["by_type_station"] = by_type_station
 
-            # ==== 4) Par propriétaire ====
+            # ==== 4) Par propriÃ©taire ====
             cursor.execute(
                 f"""
                 SELECT
@@ -9169,7 +10051,7 @@ class MeteoStationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 )
             data["by_statut_station"] = by_statut_station
 
-            # ==== 6) Par fréquence de mesure ====
+            # ==== 6) Par frÃ©quence de mesure ====
             cursor.execute(
                 f"""
                 SELECT
@@ -9199,7 +10081,7 @@ class MeteoStationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 )
             data["by_freq_mesure"] = by_freq_mesure
 
-            # ==== 7) Par type de relevé ====
+            # ==== 7) Par type de relevÃ© ====
             cursor.execute(
                 f"""
                 SELECT
@@ -9229,7 +10111,7 @@ class MeteoStationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 )
             data["by_type_releve"] = by_type_releve
 
-            # ==== 8) Par état des équipements ====
+            # ==== 8) Par Ã©tat des Ã©quipements ====
             cursor.execute(
                 f"""
                 SELECT
@@ -9268,7 +10150,7 @@ class MeteoStationAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
 
 class OuvrageListView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Liste des ouvrages (marts.vw_ouvrage), filtrés par projet actif.
+    Liste des ouvrages (marts.vw_ouvrage), filtrÃ©s par projet actif.
 
     Filtres possibles en query string :
     - ?search=...                    (code_ouvrage, localite, type_ouvrages_label,
@@ -9277,7 +10159,7 @@ class OuvrageListView(CurrentProjectRequiredMixin, GenericAPIView):
     - ?region_id=...
     - ?prefecture_id=...
     - ?commune_id=...
-    - ?type_ouvrage_code=...        (code ref.type_ouvrage ; testé sur
+    - ?type_ouvrage_code=...        (code ref.type_ouvrage ; testÃ© sur
                                      type_ouvrages_codes)
     - ?etat_anti=...                (code ref.etat_ouvrage)
     - ?etat_couv=...                (code ref.etat_ouvrage)
@@ -9317,8 +10199,7 @@ class OuvrageListView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -9333,12 +10214,12 @@ class OuvrageListView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Type d’ouvrage (code dans tableau type_ouvrages_codes)
+        # Type dâ€™ouvrage (code dans tableau type_ouvrages_codes)
         if type_ouvrage_code:
             where_clauses.append("%s = ANY(type_ouvrages_codes)")
             params.append(type_ouvrage_code)
 
-        # État des ouvrages
+        # Ã‰tat des ouvrages
         if etat_anti:
             where_clauses.append("etat_anti = %s")
             params.append(etat_anti)
@@ -9364,10 +10245,10 @@ class OuvrageListView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("surface_couv_ha <= %s")
             params.append(surface_max)
 
-        # Statut / géométrie
+        # Statut / gÃ©omÃ©trie
         if is_active in ("true", "false"):
-            where_clauses.append("is_active = %s")
-            params.append(is_active == "true")
+            where_clauses.append(sql_bool("is_active", is_active == "true"))
+
 
         if has_geom in ("true", "false"):
             if has_geom == "true":
@@ -9430,7 +10311,7 @@ class OuvrageListView(CurrentProjectRequiredMixin, GenericAPIView):
             )
             total = cursor.fetchone()[0]
 
-            # 2) Lignes paginées
+            # 2) Lignes paginÃ©es
             cursor.execute(
                 f"""
                 SELECT *
@@ -9470,10 +10351,10 @@ class OuvrageListView(CurrentProjectRequiredMixin, GenericAPIView):
 
 class OuvrageAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Agrégations sur les ouvrages (marts.vw_ouvrage),
-    filtrés par projet actif via project_code (FIERE / AGRIECO).
+    AgrÃ©gations sur les ouvrages (marts.vw_ouvrage),
+    filtrÃ©s par projet actif via project_code (FIERE / AGRIECO).
 
-    Filtres possibles en query string (identiques à OuvrageListView) :
+    Filtres possibles en query string (identiques Ã  OuvrageListView) :
     - ?search=...
     - ?region_id=...
     - ?prefecture_id=...
@@ -9517,8 +10398,7 @@ class OuvrageAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -9533,12 +10413,12 @@ class OuvrageAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Type d’ouvrage
+        # Type dâ€™ouvrage
         if type_ouvrage_code:
             where_clauses.append("%s = ANY(type_ouvrages_codes)")
             params.append(type_ouvrage_code)
 
-        # États
+        # Ã‰tats
         if etat_anti:
             where_clauses.append("etat_anti = %s")
             params.append(etat_anti)
@@ -9564,10 +10444,10 @@ class OuvrageAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("surface_couv_ha <= %s")
             params.append(surface_max)
 
-        # Statut / géométrie
+        # Statut / gÃ©omÃ©trie
         if is_active in ("true", "false"):
-            where_clauses.append("is_active = %s")
-            params.append(is_active == "true")
+            where_clauses.append(sql_bool("is_active", is_active == "true"))
+
 
         if has_geom in ("true", "false"):
             if has_geom == "true":
@@ -9637,7 +10517,7 @@ class OuvrageAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 "surface_max_ha": row[11],
             }
 
-            # ==== 2) Par région ====
+            # ==== 2) Par rÃ©gion ====
             cursor.execute(
                 f"""
                 SELECT
@@ -9679,7 +10559,7 @@ class OuvrageAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 )
             data["by_region"] = by_region
 
-            # ==== 3) Par type d’ouvrage (array unnest) ====
+            # ==== 3) Par type dâ€™ouvrage (array unnest) ====
             cursor.execute(
                 f"""
                 SELECT
@@ -9718,7 +10598,7 @@ class OuvrageAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 )
             data["by_type_ouvrage"] = by_type_ouvrage
 
-            # ==== 4) Par état antiérosion ====
+            # ==== 4) Par Ã©tat antiÃ©rosion ====
             cursor.execute(
                 f"""
                 SELECT
@@ -9746,7 +10626,7 @@ class OuvrageAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 )
             data["by_etat_anti"] = by_etat_anti
 
-            # ==== 5) Par état des couvertures ====
+            # ==== 5) Par Ã©tat des couvertures ====
             cursor.execute(
                 f"""
                 SELECT
@@ -9784,8 +10664,8 @@ class OuvrageAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
 
 class PratiquesAgroParcelleListView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Pratiques agroécologiques par parcelle (marts.vw_pratiques_agro_parcelle),
-    filtrées par projet actif (project_code).
+    Pratiques agroÃ©cologiques par parcelle (marts.vw_pratiques_agro_parcelle),
+    filtrÃ©es par projet actif (project_code).
 
     Filtres possibles en query string :
     - ?search=...                  (localite, culture_label, pratiques_agroeco_label,
@@ -9840,8 +10720,7 @@ class PratiquesAgroParcelleListView(CurrentProjectRequiredMixin, GenericAPIView)
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -9903,10 +10782,10 @@ class PratiquesAgroParcelleListView(CurrentProjectRequiredMixin, GenericAPIView)
             where_clauses.append("rendement_observe_kg_ha <= %s")
             params.append(rendement_obs_max)
 
-        # Statut / géométrie
+        # Statut / gÃ©omÃ©trie
         if is_active in ("true", "false"):
-            where_clauses.append("is_active = %s")
-            params.append(is_active == "true")
+            where_clauses.append(sql_bool("is_active", is_active == "true"))
+
 
         if has_geom in ("true", "false"):
             if has_geom == "true":
@@ -9969,7 +10848,7 @@ class PratiquesAgroParcelleListView(CurrentProjectRequiredMixin, GenericAPIView)
             )
             total = cursor.fetchone()[0]
 
-            # 2) Lignes paginées
+            # 2) Lignes paginÃ©es
             cursor.execute(
                 f"""
                 SELECT *
@@ -10008,10 +10887,10 @@ class PratiquesAgroParcelleListView(CurrentProjectRequiredMixin, GenericAPIView)
 
 class PratiquesAgroParcelleAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Agrégations sur les pratiques agroécologiques par parcelle
-    (marts.vw_pratiques_agro_parcelle), filtrées par projet actif (FIERE / AGRIECO).
+    AgrÃ©gations sur les pratiques agroÃ©cologiques par parcelle
+    (marts.vw_pratiques_agro_parcelle), filtrÃ©es par projet actif (FIERE / AGRIECO).
 
-    Filtres possibles en query string (identiques à PratiquesAgroParcelleListView) :
+    Filtres possibles en query string (identiques Ã  PratiquesAgroParcelleListView) :
     - ?search=...
     - ?region_id=...
     - ?prefecture_id=...
@@ -10063,8 +10942,7 @@ class PratiquesAgroParcelleAggregatesView(CurrentProjectRequiredMixin, GenericAP
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -10125,10 +11003,10 @@ class PratiquesAgroParcelleAggregatesView(CurrentProjectRequiredMixin, GenericAP
             where_clauses.append("rendement_observe_kg_ha <= %s")
             params.append(rendement_obs_max)
 
-        # Statut / géométrie
+        # Statut / gÃ©omÃ©trie
         if is_active in ("true", "false"):
-            where_clauses.append("is_active = %s")
-            params.append(is_active == "true")
+            where_clauses.append(sql_bool("is_active", is_active == "true"))
+
 
         if has_geom in ("true", "false"):
             if has_geom == "true":
@@ -10186,6 +11064,8 @@ class PratiquesAgroParcelleAggregatesView(CurrentProjectRequiredMixin, GenericAP
 
             data["global"] = {
                 "nb_parcelles": nb_parcelles,
+                "nb_pratiques": nb_parcelles,      # alias dashboard
+                "total_pratiques": nb_parcelles,   # alias dashboard
                 "nb_actives": nb_actives,
                 "nb_inactives": nb_parcelles - nb_actives,
                 "nb_with_geom": nb_with_geom,
@@ -10203,7 +11083,7 @@ class PratiquesAgroParcelleAggregatesView(CurrentProjectRequiredMixin, GenericAP
                 "rendement_obs_max_kg_ha": row[13],
             }
 
-            # ==== 2) Par région ====
+            # ==== 2) Par rÃ©gion ====
             cursor.execute(
                 f"""
                 SELECT
@@ -10303,7 +11183,7 @@ class PratiquesAgroParcelleAggregatesView(CurrentProjectRequiredMixin, GenericAP
                 )
             data["by_campagne"] = by_campagne
 
-            # ==== 5) Par pratique agroécologique (unnest) ====
+            # ==== 5) Par pratique agroÃ©cologique (unnest) ====
             cursor.execute(
                 f"""
                 SELECT
@@ -10403,12 +11283,12 @@ class PratiquesAgroParcelleAggregatesView(CurrentProjectRequiredMixin, GenericAP
 
 
 # -----------------------------------------------------------------------------
-# Liste des têtes sources
+# Liste des tÃªtes sources
 # -----------------------------------------------------------------------------
 
 class TeteSourceListView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Têtes de source (marts.vw_tete_source), filtrées par projet actif.
+    TÃªtes de source (marts.vw_tete_source), filtrÃ©es par projet actif.
 
     Filtres possibles en query string :
     - ?search=...                   (id_ts, localite, type_source_label,
@@ -10420,7 +11300,7 @@ class TeteSourceListView(CurrentProjectRequiredMixin, GenericAPIView):
     - ?type_source=...              (code ref.type_source)
     - ?usage_principal=...          (code ref.usage_source)
     - ?etat_fonctionnel=...         (code ref.etat_fonctionnel)
-    - ?type_protection_code=...     (code ref.type_protection ; testé dans type_protection_codes)
+    - ?type_protection_code=...     (code ref.type_protection ; testÃ© dans type_protection_codes)
     - ?protection_exist=true|false
     - ?entretien_regulier=true|false
     - ?annee_protection_from=...
@@ -10459,8 +11339,7 @@ class TeteSourceListView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -10475,7 +11354,7 @@ class TeteSourceListView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Typologie tête de source
+        # Typologie tÃªte de source
         if type_source:
             where_clauses.append("type_source = %s")
             params.append(type_source)
@@ -10493,16 +11372,14 @@ class TeteSourceListView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("%s = ANY(type_protection_codes)")
             params.append(type_protection_code)
 
-        # Booléens
+        # BoolÃ©ens
         if protection_exist in ("true", "false"):
-            where_clauses.append("protection_exist = %s")
-            params.append(protection_exist == "true")
+            where_clauses.append(sql_bool("protection_exist", protection_exist == "true"))
 
         if entretien_regulier in ("true", "false"):
-            where_clauses.append("entretien_regulier = %s")
-            params.append(entretien_regulier == "true")
+            where_clauses.append(sql_bool("entretien_regulier", entretien_regulier == "true"))
 
-        # Année de protection
+        # AnnÃ©e de protection
         if annee_protection_from:
             where_clauses.append("annee_protection >= %s")
             params.append(annee_protection_from)
@@ -10511,10 +11388,10 @@ class TeteSourceListView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("annee_protection <= %s")
             params.append(annee_protection_to)
 
-        # Statut / géométrie
+        # Statut / gÃ©omÃ©trie
         if is_active in ("true", "false"):
-            where_clauses.append("is_active = %s")
-            params.append(is_active == "true")
+            where_clauses.append(sql_bool("is_active", is_active == "true"))
+
 
         if has_geom in ("true", "false"):
             if has_geom == "true":
@@ -10578,7 +11455,7 @@ class TeteSourceListView(CurrentProjectRequiredMixin, GenericAPIView):
             )
             total = cursor.fetchone()[0]
 
-            # 2) Lignes paginées
+            # 2) Lignes paginÃ©es
             cursor.execute(
                 f"""
                 SELECT *
@@ -10618,11 +11495,11 @@ class TeteSourceListView(CurrentProjectRequiredMixin, GenericAPIView):
 
 class TeteSourceAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Agrégations sur les têtes de sources (marts.vw_tete_source),
-    filtrées par projet actif via project_code (FIERE / AGRIECO).
+    AgrÃ©gations sur les tÃªtes de sources (marts.vw_tete_source),
+    filtrÃ©es par projet actif via project_code (FIERE / AGRIECO).
 
-    + Ajout d'une estimation d'accès à l'eau potable :
-      - pop_desservie (Kobo) / population de référence (ref.localite) agrégé par commune.
+    + Ajout d'une estimation d'accÃ¨s Ã  l'eau potable :
+      - pop_desservie (Kobo) / population de rÃ©fÃ©rence (ref.localite) agrÃ©gÃ© par commune.
     """
 
     permission_classes = [IsAuthenticated]
@@ -10646,8 +11523,7 @@ class TeteSourceAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -10662,10 +11538,9 @@ class TeteSourceAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Filtres spécifiques
+        # Filtres spÃ©cifiques
         if protection_exist in ("true", "false"):
-            where_clauses.append("protection_exist = %s")
-            params.append(protection_exist == "true")
+            where_clauses.append(sql_bool("protection_exist", protection_exist == "true"))
 
         if type_protection:
             where_clauses.append("type_protection = %s")
@@ -10675,10 +11550,10 @@ class TeteSourceAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("etat_fonctionnel = %s")
             params.append(etat_fonctionnel)
 
-        # Statut / géométrie
+        # Statut / gÃ©omÃ©trie
         if is_active in ("true", "false"):
-            where_clauses.append("is_active = %s")
-            params.append(is_active == "true")
+            where_clauses.append(sql_bool("is_active", is_active == "true"))
+
 
         if has_geom in ("true", "false"):
             if has_geom == "true":
@@ -10692,7 +11567,7 @@ class TeteSourceAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 "("
                 "localite ILIKE %s OR "
                 "type_source_label ILIKE %s OR "
-                "type_protection_label ILIKE %s OR "
+                "type_protection_labels ILIKE %s OR "
                 "commune_nom ILIKE %s OR "
                 "region_nom ILIKE %s"
                 ")"
@@ -10709,7 +11584,7 @@ class TeteSourceAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 f"""
                 SELECT
                     COUNT(*) AS nb_tetes_source,
-                    COUNT(*) FILTER (WHERE protection_exist IS TRUE) AS nb_protegees,
+                    COUNT(*) FILTER (WHERE {sql_true("protection_exist")}) AS nb_protegees,
                     COUNT(*) FILTER (WHERE etat_fonctionnel = 'FONCTIONNEL') AS nb_fonctionnelles,
                     COUNT(*) FILTER (WHERE geom IS NOT NULL) AS nb_avec_geom,
                     COALESCE(SUM(pop_desservie), 0) AS pop_desservie_total
@@ -10727,14 +11602,14 @@ class TeteSourceAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 "pop_desservie_total": float(row[4]) if row[4] is not None else 0.0,
             }
 
-            # ==== 2) Par région ====
+            # ==== 2) Par rÃ©gion ====
             cursor.execute(
                 f"""
                 SELECT
                     id_region,
                     region_nom,
                     COUNT(*) AS nb_ts,
-                    COUNT(*) FILTER (WHERE protection_exist IS TRUE) AS nb_protegees,
+                    COUNT(*) FILTER (WHERE {sql_true("protection_exist")}) AS nb_protegees,
                     COALESCE(SUM(pop_desservie), 0) AS pop_desservie
                 FROM marts.vw_tete_source
                 WHERE {where_sql}
@@ -10762,7 +11637,7 @@ class TeteSourceAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                     id_commune,
                     commune_nom,
                     COUNT(*) AS nb_ts,
-                    COUNT(*) FILTER (WHERE protection_exist IS TRUE) AS nb_protegees,
+                    COUNT(*) FILTER (WHERE {sql_true("protection_exist")}) AS nb_protegees,
                     COALESCE(SUM(pop_desservie), 0) AS pop_desservie
                 FROM marts.vw_tete_source
                 WHERE {where_sql}
@@ -10790,7 +11665,7 @@ class TeteSourceAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                     type_source,
                     type_source_label,
                     COUNT(*) AS nb_ts,
-                    COUNT(*) FILTER (WHERE protection_exist IS TRUE) AS nb_protegees
+                    COUNT(*) FILTER (WHERE {sql_true("protection_exist")}) AS nb_protegees
                 FROM marts.vw_tete_source
                 WHERE {where_sql}
                 GROUP BY type_source, type_source_label
@@ -10815,7 +11690,7 @@ class TeteSourceAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 )
             data["by_type_source"] = by_type_source
 
-            # ==== 5) Par état fonctionnel ====
+            # ==== 5) Par Ã©tat fonctionnel ====
             cursor.execute(
                 f"""
                 SELECT
@@ -10849,13 +11724,18 @@ class TeteSourceAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             cursor.execute(
                 f"""
                 SELECT
-                    type_protection,
-                    type_protection_label,
-                    COUNT(*) AS nb_ts,
-                    COUNT(*) FILTER (WHERE protection_exist IS TRUE) AS nb_protegees
-                FROM marts.vw_tete_source
-                WHERE {where_sql}
-                GROUP BY type_protection, type_protection_label
+                    u.code AS type_protection_code,
+                    MAX(tp.label_fr) AS type_protection_label,
+                    COUNT(DISTINCT ts.id_ts) AS nb_ts,
+                    COUNT(DISTINCT ts.id_ts) FILTER (WHERE {sql_true("ts.protection_exist")}) AS nb_protegees
+                FROM (
+                    SELECT *
+                    FROM marts.vw_tete_source
+                    WHERE {where_sql}
+                ) ts
+                LEFT JOIN LATERAL unnest(ts.type_protection_codes) AS u(code) ON TRUE
+                LEFT JOIN ref.type_protection tp ON tp.code = u.code
+                GROUP BY u.code
                 ORDER BY type_protection_label
                 """,
                 params,
@@ -10877,13 +11757,13 @@ class TeteSourceAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 )
             data["by_type_protection"] = by_type_protection
 
-            # ==== 7) Par année de protection ====
+            # ==== 7) Par annÃ©e de protection ====
             cursor.execute(
                 f"""
                 SELECT
                     annee_protection,
                     COUNT(*) AS nb_ts,
-                    COUNT(*) FILTER (WHERE protection_exist IS TRUE) AS nb_protegees
+                    COUNT(*) FILTER (WHERE {sql_true("protection_exist")}) AS nb_protegees
                 FROM marts.vw_tete_source
                 WHERE {where_sql}
                 GROUP BY annee_protection
@@ -10901,8 +11781,8 @@ class TeteSourceAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 for r in rows
             ]
 
-            # ✅ ==== 8) Accès eau potable (estimation) ====
-            # A) pop_desservie par commune (sources protégées actives)
+            # âœ… ==== 8) AccÃ¨s eau potable (estimation) ====
+            # A) pop_desservie par commune (sources protÃ©gÃ©es actives)
             cursor.execute(
                 f"""
                 SELECT
@@ -10910,8 +11790,8 @@ class TeteSourceAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                     COALESCE(SUM(pop_desservie), 0) AS pop_desservie
                 FROM marts.vw_tete_source
                 WHERE {where_sql}
-                  AND protection_exist IS TRUE
-                  AND is_active IS TRUE
+                  AND {sql_true("protection_exist")}
+                  AND {sql_true("is_active")}
                   AND id_commune IS NOT NULL
                 GROUP BY id_commune
                 """,
@@ -10920,7 +11800,7 @@ class TeteSourceAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             rows = cursor.fetchall()
             desservie_map = {r[0]: float(r[1] or 0) for r in rows}
 
-            # B) population de référence par commune (ref.localite)
+            # B) population de rÃ©fÃ©rence par commune (ref.localite)
             pop_where = ["1=1"]
             pop_params: list = []
 
@@ -10987,7 +11867,7 @@ class TeteSourceAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 "by_commune": by_commune,
             }
 
-            # Bonus aussi dans global (pratique côté front)
+            # Bonus aussi dans global (pratique cÃ´tÃ© front)
             data["global"]["population_reference_total"] = pop_total
             data["global"]["taux_acces_eau_potable_pct"] = taux_global
 
@@ -10996,13 +11876,13 @@ class TeteSourceAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
 
 
 # -----------------------------------------------------------------------------
-# Liste des zone dégradée
+# Liste des zone dÃ©gradÃ©e
 # -----------------------------------------------------------------------------
 
 class ZoneDegradeeListView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Zones dégradées et restaurées (marts.vw_zone_degradee),
-    filtrées par projet actif (project_code).
+    Zones dÃ©gradÃ©es et restaurÃ©es (marts.vw_zone_degradee),
+    filtrÃ©es par projet actif (project_code).
 
     Filtres possibles en query string :
     - ?search=...                    (id_zone, localite, type_degradation_label,
@@ -11016,8 +11896,8 @@ class ZoneDegradeeListView(CurrentProjectRequiredMixin, GenericAPIView):
     - ?type_degradation=...         (code ref.type_degradation)
     - ?severite=...                 (code ref.severite_degradation)
     - ?etat_restaur=...             (code ref.etat_restaur)
-    - ?type_intervention_code=...   (code ref.type_intervention ; testé dans type_intervention_codes)
-    - ?espece_code=...              (code ref.espece_reboisement ; testé dans especes_codes)
+    - ?type_intervention_code=...   (code ref.type_intervention ; testÃ© dans type_intervention_codes)
+    - ?espece_code=...              (code ref.espece_reboisement ; testÃ© dans especes_codes)
 
     - ?zone_degrad_pres=true|false
     - ?restauration_real=true|false
@@ -11096,8 +11976,7 @@ class ZoneDegradeeListView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -11112,7 +11991,7 @@ class ZoneDegradeeListView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Typologie de dégradation / restauration
+        # Typologie de dÃ©gradation / restauration
         if type_degradation:
             where_clauses.append("type_degradation = %s")
             params.append(type_degradation)
@@ -11135,20 +12014,17 @@ class ZoneDegradeeListView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("%s = ANY(especes_codes)")
             params.append(espece_code)
 
-        # Booléens
+        # BoolÃ©ens
         if zone_degrad_pres in ("true", "false"):
-            where_clauses.append("zone_degrad_pres = %s")
-            params.append(zone_degrad_pres == "true")
+            where_clauses.append(sql_bool("zone_degrad_pres", zone_degrad_pres == "true"))
 
         if restauration_real in ("true", "false"):
-            where_clauses.append("restauration_real = %s")
-            params.append(restauration_real == "true")
+            where_clauses.append(sql_bool("restauration_real", restauration_real == "true"))
 
         if suivi_plantation in ("true", "false"):
-            where_clauses.append("suivi_plantation = %s")
-            params.append(suivi_plantation == "true")
+            where_clauses.append(sql_bool("suivi_plantation", suivi_plantation == "true"))
 
-        # Numériques : surfaces, plantations, terrasses, etc.
+        # NumÃ©riques : surfaces, plantations, terrasses, etc.
         if surface_degrad_min:
             where_clauses.append("surface_degrad_ha >= %s")
             params.append(surface_degrad_min)
@@ -11213,7 +12089,7 @@ class ZoneDegradeeListView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("longueur_terr_m <= %s")
             params.append(longueur_terr_max)
 
-        # Année de plantation
+        # AnnÃ©e de plantation
         if annee_plantation_from:
             where_clauses.append("annee_plantation >= %s")
             params.append(annee_plantation_from)
@@ -11222,10 +12098,10 @@ class ZoneDegradeeListView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("annee_plantation <= %s")
             params.append(annee_plantation_to)
 
-        # Statut / géométrie
+        # Statut / gÃ©omÃ©trie
         if is_active in ("true", "false"):
-            where_clauses.append("is_active = %s")
-            params.append(is_active == "true")
+            where_clauses.append(sql_bool("is_active", is_active == "true"))
+
 
         if has_geom in ("true", "false"):
             if has_geom == "true":
@@ -11291,7 +12167,7 @@ class ZoneDegradeeListView(CurrentProjectRequiredMixin, GenericAPIView):
             )
             total = cursor.fetchone()[0]
 
-            # 2) Lignes paginées
+            # 2) Lignes paginÃ©es
             cursor.execute(
                 f"""
                 SELECT *
@@ -11331,10 +12207,10 @@ class ZoneDegradeeListView(CurrentProjectRequiredMixin, GenericAPIView):
 
 class ZoneDegradeeAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Agrégations sur les zones dégradées/restaurées (marts.vw_zone_degradee),
-    filtrées par projet actif (FIERE / AGRIECO).
+    AgrÃ©gations sur les zones dÃ©gradÃ©es/restaurÃ©es (marts.vw_zone_degradee),
+    filtrÃ©es par projet actif (FIERE / AGRIECO).
 
-    Filtres possibles en query string (mêmes que ZoneDegradeeListView) :
+    Filtres possibles en query string (mÃªmes que ZoneDegradeeListView) :
     - ?search=...
     - ?region_id=...
     - ?prefecture_id=...
@@ -11418,8 +12294,7 @@ class ZoneDegradeeAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
         has_geom = request.query_params.get("has_geom")
         search = request.query_params.get("search")
 
-        where_clauses = ["project_code = %s"]
-        params: list = [project_code]
+        where_clauses, params = build_access_scope_for_project(request, project_code)
 
         # Territoire
         if region_id:
@@ -11434,7 +12309,7 @@ class ZoneDegradeeAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("id_commune = %s")
             params.append(commune_id)
 
-        # Typologie de dégradation / restauration
+        # Typologie de dÃ©gradation / restauration
         if type_degradation:
             where_clauses.append("type_degradation = %s")
             params.append(type_degradation)
@@ -11455,20 +12330,17 @@ class ZoneDegradeeAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("%s = ANY(especes_codes)")
             params.append(espece_code)
 
-        # Booléens
+        # BoolÃ©ens
         if zone_degrad_pres in ("true", "false"):
-            where_clauses.append("zone_degrad_pres = %s")
-            params.append(zone_degrad_pres == "true")
+            where_clauses.append(sql_bool("zone_degrad_pres", zone_degrad_pres == "true"))
 
         if restauration_real in ("true", "false"):
-            where_clauses.append("restauration_real = %s")
-            params.append(restauration_real == "true")
+            where_clauses.append(sql_bool("restauration_real", restauration_real == "true"))
 
         if suivi_plantation in ("true", "false"):
-            where_clauses.append("suivi_plantation = %s")
-            params.append(suivi_plantation == "true")
+            where_clauses.append(sql_bool("suivi_plantation", suivi_plantation == "true"))
 
-        # Numériques : surfaces, plantations, terrasses, etc.
+        # NumÃ©riques : surfaces, plantations, terrasses, etc.
         if surface_degrad_min:
             where_clauses.append("surface_degrad_ha >= %s")
             params.append(surface_degrad_min)
@@ -11533,7 +12405,7 @@ class ZoneDegradeeAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("longueur_terr_m <= %s")
             params.append(longueur_terr_max)
 
-        # Année de plantation
+        # AnnÃ©e de plantation
         if annee_plantation_from:
             where_clauses.append("annee_plantation >= %s")
             params.append(annee_plantation_from)
@@ -11542,10 +12414,10 @@ class ZoneDegradeeAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             where_clauses.append("annee_plantation <= %s")
             params.append(annee_plantation_to)
 
-        # Statut / géométrie
+        # Statut / gÃ©omÃ©trie
         if is_active in ("true", "false"):
-            where_clauses.append("is_active = %s")
-            params.append(is_active == "true")
+            where_clauses.append(sql_bool("is_active", is_active == "true"))
+
 
         if has_geom in ("true", "false"):
             if has_geom == "true":
@@ -11580,9 +12452,9 @@ class ZoneDegradeeAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 f"""
                 SELECT
                     COUNT(*) AS nb_zones,
-                    COUNT(*) FILTER (WHERE zone_degrad_pres IS TRUE) AS nb_zones_degradees,
-                    COUNT(*) FILTER (WHERE restauration_real IS TRUE) AS nb_zones_restaurees,
-                    COUNT(*) FILTER (WHERE suivi_plantation IS TRUE) AS nb_zones_suivies,
+                    COUNT(*) FILTER (WHERE {sql_true("zone_degrad_pres")}) AS nb_zones_degradees,
+                    COUNT(*) FILTER (WHERE {sql_true("restauration_real")}) AS nb_zones_restaurees,
+                    COUNT(*) FILTER (WHERE {sql_true("suivi_plantation")}) AS nb_zones_suivies,
                     SUM(surface_degrad_ha) AS surf_degrad_ha,
                     SUM(surface_restaur_ha) AS surf_restaur_ha,
                     SUM(surf_regen_ha) AS surf_regen_ha,
@@ -11591,6 +12463,17 @@ class ZoneDegradeeAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                     AVG(taux_survie_pct) AS taux_survie_moy_pct,
                     SUM(nb_terrasses) AS nb_terrasses_total,
                     SUM(longueur_terr_m) AS longueur_terr_total_m,
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN type_intervention_codes IS NOT NULL
+                                     AND 'PLANTATION' = ANY(type_intervention_codes)
+                                THEN COALESCE(surface_restaur_ha, 0)
+                                ELSE 0
+                            END
+                        ),
+                        0
+                    ) AS surface_plantations_ha,
                     COUNT(*) FILTER (
                         WHERE (geom_point IS NOT NULL OR geom_zone IS NOT NULL)
                     ) AS nb_with_geom
@@ -11601,7 +12484,7 @@ class ZoneDegradeeAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
             )
             row = cursor.fetchone()
             nb_zones = row[0] or 0
-            nb_with_geom = row[12] or 0
+            nb_with_geom = row[13] or 0
 
             data["global"] = {
                 "nb_zones": nb_zones,
@@ -11612,23 +12495,25 @@ class ZoneDegradeeAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 "surface_restauree_ha": float(row[5]) if row[5] is not None else 0.0,
                 "surface_regeneree_ha": float(row[6]) if row[6] is not None else 0.0,
                 "nb_plants_total": int(row[7]) if row[7] is not None else 0,
+                "nb_plants": int(row[7]) if row[7] is not None else 0,  # alias front
                 "densite_moy_plants_ha": float(row[8]) if row[8] is not None else None,
                 "taux_survie_moy_pct": float(row[9]) if row[9] is not None else None,
                 "nb_terrasses_total": int(row[10]) if row[10] is not None else 0,
                 "longueur_terr_total_m": float(row[11]) if row[11] is not None else 0.0,
+                "surface_plantations_ha": float(row[12]) if row[12] is not None else 0.0,
                 "nb_with_geom": nb_with_geom,
                 "nb_without_geom": nb_zones - nb_with_geom,
             }
 
-            # ==== 2) Par région ====
+            # ==== 2) Par rÃ©gion ====
             cursor.execute(
                 f"""
                 SELECT
                     id_region,
                     region_nom,
                     COUNT(*) AS nb_zones,
-                    COUNT(*) FILTER (WHERE zone_degrad_pres IS TRUE) AS nb_zones_degradees,
-                    COUNT(*) FILTER (WHERE restauration_real IS TRUE) AS nb_zones_restaurees,
+                    COUNT(*) FILTER (WHERE {sql_true("zone_degrad_pres")}) AS nb_zones_degradees,
+                    COUNT(*) FILTER (WHERE {sql_true("restauration_real")}) AS nb_zones_restaurees,
                     SUM(surface_degrad_ha) AS surf_degrad_ha,
                     SUM(surface_restaur_ha) AS surf_restaur_ha,
                     SUM(surf_regen_ha) AS surf_regen_ha
@@ -11656,7 +12541,7 @@ class ZoneDegradeeAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 )
             data["by_region"] = by_region
 
-            # ==== 3) Par type de dégradation ====
+            # ==== 3) Par type de dÃ©gradation ====
             cursor.execute(
                 f"""
                 SELECT
@@ -11686,7 +12571,7 @@ class ZoneDegradeeAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 )
             data["by_type_degradation"] = by_type_degradation
 
-            # ==== 4) Par état de restauration ====
+            # ==== 4) Par Ã©tat de restauration ====
             cursor.execute(
                 f"""
                 SELECT
@@ -11714,7 +12599,7 @@ class ZoneDegradeeAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 )
             data["by_etat_restaur"] = by_etat_restaur
 
-            # ==== 5) Par sévérité ====
+            # ==== 5) Par sÃ©vÃ©ritÃ© ====
             cursor.execute(
                 f"""
                 SELECT
@@ -11742,12 +12627,12 @@ class ZoneDegradeeAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 )
             data["by_severite"] = by_severite
 
-            # ==== 6) Par type d’intervention (unnest) ====
+            # ==== 6) Par type dâ€™intervention (unnest) ====
             cursor.execute(
                 f"""
                 SELECT
                     u.code AS type_intervention_code,
-                    MAX(ti.libelle) AS type_intervention_label,
+                    MAX(ti.label_fr) AS type_intervention_label,
                     COUNT(DISTINCT zd.id_zone) AS nb_zones,
                     SUM(zd.surface_restaur_ha) AS surf_restaur_ha
                 FROM (
@@ -11778,12 +12663,12 @@ class ZoneDegradeeAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 )
             data["by_type_intervention"] = by_type_intervention
 
-            # ==== 7) Par espèce (unnest) ====
+            # ==== 7) Par espÃ¨ce (unnest) ====
             cursor.execute(
                 f"""
                 SELECT
                     u.code AS espece_code,
-                    MAX(e.libelle) AS espece_label,
+                    MAX(e.label_fr) AS espece_label,
                     COUNT(DISTINCT zd.id_zone) AS nb_zones,
                     SUM(zd.nb_plants) AS nb_plants
                 FROM (
@@ -11814,7 +12699,7 @@ class ZoneDegradeeAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
                 )
             data["by_espece"] = by_espece
 
-            # ==== 8) Par année de plantation ====
+            # ==== 8) Par annÃ©e de plantation ====
             cursor.execute(
                 f"""
                 SELECT
@@ -11851,10 +12736,10 @@ class ZoneDegradeeAggregatesView(CurrentProjectRequiredMixin, GenericAPIView):
 
 class BaseGeoJSONView(CurrentProjectRequiredMixin, GenericAPIView):
     """
-    Vue générique pour exposer une table du schéma `ref` en GeoJSON.
+    Vue gÃ©nÃ©rique pour exposer une table du schÃ©ma `ref` en GeoJSON.
 
     - retourne un FeatureCollection
-    - les propriétés = toutes les colonnes sauf la géométrie
+    - les propriÃ©tÃ©s = toutes les colonnes sauf la gÃ©omÃ©trie
     """
 
     permission_classes = [IsAuthenticated]
@@ -11866,7 +12751,7 @@ class BaseGeoJSONView(CurrentProjectRequiredMixin, GenericAPIView):
 
     def build_where_clause(self, request):
         """
-        À surcharger dans les classes filles.
+        Ã€ surcharger dans les classes filles.
         Retourne (where_sql, params).
         """
         return "TRUE", []
@@ -12147,7 +13032,7 @@ class ZoneSableuseGeoJSONView(CommuneBasedGeoJSONView):
 
 class LinearGeoJSONView(BaseGeoJSONView):
     """
-    Base pour les tables linéaires sans id_commune (hydro, routes).
+    Base pour les tables linÃ©aires sans id_commune (hydro, routes).
     Filtres spatiaux :
     - ?commune_id=
     - ?prefecture_id=
@@ -12206,7 +13091,7 @@ class HydrographieGeoJSONView(LinearGeoJSONView):
     table_name = "ref.hydrographie"
     id_column = "hydro_id"
     geom_column = "geom"
-    default_ordering = "nom"  # ou 'hydro_id' si tu préfères
+    default_ordering = "nom"  # ou 'hydro_id' si tu prÃ©fÃ¨res
 
 
 class ReseauRoutierGeoJSONView(LinearGeoJSONView):
@@ -12233,3 +13118,8 @@ class ReseauRoutierGeoJSONView(LinearGeoJSONView):
 # -----------------------------------------------------------------------------
 # Liste des parcelles
 # -----------------------------------------------------------------------------
+
+
+
+
+

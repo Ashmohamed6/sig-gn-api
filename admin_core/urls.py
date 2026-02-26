@@ -9,6 +9,7 @@ from .views import (
     AdminUserDetailView,
     AdminUserActivateView,
     AdminUserDeactivateView,
+    AdminUserResetPasswordView,
     AdminUserStatsView,
     AdminDashboardView,
 )
@@ -32,4 +33,5 @@ urlpatterns = [
     # Actions spéciales
     path('users/<int:id>/activate/', AdminUserActivateView.as_view(), name='admin_users_activate'),
     path('users/<int:id>/deactivate/', AdminUserDeactivateView.as_view(), name='admin_users_deactivate'),
+    path('users/<int:id>/reset-password/', AdminUserResetPasswordView.as_view(), name='admin_users_reset_password'),
 ]

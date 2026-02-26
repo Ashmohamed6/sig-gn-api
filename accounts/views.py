@@ -5,8 +5,9 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
-from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
+from .throttles import AuthIdentifierRateThrottle
 from .serializers import (
     CurrentUserSerializer,
     RefProjectSerializer,
@@ -39,6 +40,12 @@ class LoginView(APIView):
     """
     permission_classes = [permissions.AllowAny]
     serializer_class = LoginSerializer  # pour drf-spectacular
+    throttle_scope = "auth"
+
+    def get_throttles(self):
+        throttles = super().get_throttles()
+        throttles.append(AuthIdentifierRateThrottle())
+        return throttles
 
     def post(self, request, *args, **kwargs):
         serializer = LoginSerializer(data=request.data)
@@ -92,6 +99,16 @@ class EmailOrUsernameTokenView(TokenObtainPairView):
     Accepte un username OU un email dans le champ "username".
     """
     serializer_class = EmailOrUsernameTokenObtainPairSerializer
+    throttle_scope = "auth"
+
+    def get_throttles(self):
+        throttles = super().get_throttles()
+        throttles.append(AuthIdentifierRateThrottle())
+        return throttles
+
+
+class ScopedTokenRefreshView(TokenRefreshView):
+    throttle_scope = "token_refresh"
 
 
 class MeView(APIView):

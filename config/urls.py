@@ -20,6 +20,8 @@ urlpatterns = [
     path("api/dashboard/", include("dashboard.urls")),
     path("api/data/", include("data_api.urls")),
     path("api/admin/", include("admin_core.urls")),
+    path("api/workflow/", include("workflow_core.urls")),
+    path("api/import/", include("import_core.urls")),
 ]
 
 

@@ -1,5 +1,6 @@
 from django.utils.deprecation import MiddlewareMixin
 from django.conf import settings
+import re
 
 from .models import RefProject
 
@@ -35,6 +36,30 @@ class CurrentProjectMiddleware(MiddlewareMixin):
         "agglomeration",
         "habitation-dispersee",
     )
+    PROJECT_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{2,50}$")
+
+    @staticmethod
+    def _normalize_role(user) -> str:
+        return str(getattr(user, "role", "") or "").strip().lower()
+
+    @classmethod
+    def _is_global_admin(cls, user) -> bool:
+        role = cls._normalize_role(user)
+        return bool(user and user.is_authenticated and (user.is_staff or user.is_superuser or role == "admin"))
+
+    @classmethod
+    def _is_project_admin(cls, user) -> bool:
+        role = cls._normalize_role(user)
+        return bool(
+            user
+            and user.is_authenticated
+            and (user.is_staff or user.is_superuser or role in {"admin", "project_manager"})
+        )
+
+    @classmethod
+    def _is_platform_admin(cls, user) -> bool:
+        # Alias retro-compatible: admin global uniquement.
+        return cls._is_global_admin(user)
 
     def process_request(self, request):
         # On ne touche pas à l'admin Django, etc.
@@ -53,10 +78,12 @@ class CurrentProjectMiddleware(MiddlewareMixin):
         # -------------------------
         # Région (déduite du profil)
         # -------------------------
-        # users non-admin : région imposée
-        # admin/staff : possibilité de surcharger via ?region=GN005 (sinon None => toutes régions)
-        if user.is_staff or user.is_superuser:
-            request.current_region_id = request.GET.get("region") or getattr(user, "region_id", None)
+        # users operationnels : region imposee
+        # admin global / chef projet : possibilite de surcharger via ?region=GN005 (sinon None => toutes regions du projet)
+        if self._is_project_admin(user):
+            # Admin global et chef projet: pas de region imposee par defaut.
+            # Un filtre optionnel ?region=... peut etre fourni.
+            request.current_region_id = request.GET.get("region") or None
         else:
             request.current_region_id = getattr(user, "region_id", None)
 
@@ -71,22 +98,18 @@ class CurrentProjectMiddleware(MiddlewareMixin):
 
         project = None
         if code:
+            code = code.strip().upper()
+            if not self.PROJECT_CODE_PATTERN.match(code):
+                request.current_project = None
+                return
+
             try:
-                project = RefProject.objects.get(code_fonc=code, actif=True)
+                project = RefProject.objects.get(code_fonc__iexact=code, actif=True)
             except RefProject.DoesNotExist:
                 project = None
-        else:
-            # Fallback PRO : si l'user a un default_project_id, on peut l'utiliser
-            # (ne bloque pas l'accès aux couches ref)
-            default_pid = getattr(user, "default_project_id", None)
-            if default_pid:
-                try:
-                    project = RefProject.objects.get(project_id=default_pid, actif=True)
-                except RefProject.DoesNotExist:
-                    project = None
 
         # Sécurité : on ne garde le projet que s'il appartient à l'utilisateur (hors admin/staff)
-        if project and not (user.is_staff or user.is_superuser):
+        if project and not self._is_global_admin(user):
             if not user.projects.filter(project_id=project.project_id).exists():
                 project = None
 

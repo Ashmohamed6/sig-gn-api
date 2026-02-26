@@ -4,6 +4,10 @@ from django.urls import path, include
 
 from .views import (
     PingView,
+    DataEntityUpdateView,
+    DataEntityDeleteView,
+    DataEntityBulkDeleteView,
+    DataEntityPurgeView,
     EntrepriseListView,
     EntrepriseAggregationView,
     ActeurParticipationListView,
@@ -43,10 +47,23 @@ from .views import (
     ZoneDegradeeListView,
     ZoneDegradeeAggregatesView,
 )
+from .views_referentiels_admin import (
+    ReferentielLayerListView,
+    ReferentielLayerSchemaView,
+    ReferentielRecordCreateView,
+    ReferentielRecordDetailView,
+    ReferentielCsvUploadView,
+    ReferentielLayerTruncateView,
+    ReferentielRecomputeCommuneView,
+)
 
 urlpatterns = [
     # --- API data (tableaux / stats) ---
     path("ping/", PingView.as_view(), name="data_ping"),
+    path("entities/<str:table_id>/update/", DataEntityUpdateView.as_view(), name="data-entity-update"),
+    path("entities/<str:table_id>/records/<str:record_id>/", DataEntityDeleteView.as_view(), name="data-entity-delete"),
+    path("entities/<str:table_id>/bulk-delete/", DataEntityBulkDeleteView.as_view(), name="data-entity-bulk-delete"),
+    path("entities/<str:table_id>/purge/", DataEntityPurgeView.as_view(), name="data-entity-purge"),
 
     path("entreprises/", EntrepriseListView.as_view(), name="entreprise-list"),
     path("entreprises/stats/", EntrepriseAggregationView.as_view(), name="entreprise-aggregations"),
@@ -105,6 +122,20 @@ urlpatterns = [
     path("zone-degradee/", ZoneDegradeeListView.as_view(), name="zone-degradee-list"),
     path("zone-degradee/stats/", ZoneDegradeeAggregatesView.as_view(), name="zone-degradee-aggregates"),
 
+    # --- Administration referentiels (CRUD + upload CSV) ---
+    path("referentiels/layers/", ReferentielLayerListView.as_view(), name="referentiels-layers"),
+    path("referentiels/<str:layer_id>/schema/", ReferentielLayerSchemaView.as_view(), name="referentiels-schema"),
+    path("referentiels/<str:layer_id>/records/", ReferentielRecordCreateView.as_view(), name="referentiels-record-create"),
+    path(
+        "referentiels/<str:layer_id>/records/<str:record_id>/",
+        ReferentielRecordDetailView.as_view(),
+        name="referentiels-record-detail",
+    ),
+    path("referentiels/<str:layer_id>/upload-csv/", ReferentielCsvUploadView.as_view(), name="referentiels-upload-csv"),
+    path("referentiels/<str:layer_id>/truncate/", ReferentielLayerTruncateView.as_view(), name="referentiels-truncate"),
+    path("referentiels/maintenance/recompute-id-commune/", ReferentielRecomputeCommuneView.as_view(), name="referentiels-maint-recompute-id-commune"),
+
     # --- Volet carto : on inclut UNIQUEMENT urls_geojson ---
     path("", include("data_api.urls_geojson")),
 ]
+

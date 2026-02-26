@@ -1,5 +1,4 @@
 from django.urls import path
-from rest_framework_simplejwt.views import TokenRefreshView
 
 from .views import (
     MeView,
@@ -7,6 +6,7 @@ from .views import (
     LoginView,
     SignupView,
     EmailOrUsernameTokenView,
+    ScopedTokenRefreshView,
 )
 
 urlpatterns = [
@@ -18,7 +18,7 @@ urlpatterns = [
     # --- Auth JWT "classique" ---
     # Utilisé par le front (Next) via /api/auth/login
     path("token/", EmailOrUsernameTokenView.as_view(), name="accounts_token_create"),
-    path("token/refresh/", TokenRefreshView.as_view(), name="accounts_token_refresh"),
+    path("token/refresh/", ScopedTokenRefreshView.as_view(), name="accounts_token_refresh"),
 
     # --- User courant & projet actif ---
     path("me/", MeView.as_view(), name="accounts_me"),

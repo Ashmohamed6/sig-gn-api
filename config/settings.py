@@ -1,8 +1,10 @@
 import os
+import json
 from pathlib import Path
 from datetime import timedelta
 
 import environ
+from django.core.exceptions import ImproperlyConfigured
 from corsheaders.defaults import default_headers
 
 # -----------------------------------------------------------------------------
@@ -25,6 +27,16 @@ def env_bool(name: str, default: bool = False) -> bool:
 def env_list(name: str, default: str = "") -> list[str]:
     raw = os.getenv(name, default)
     return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def env_json(name: str, default):
+    raw = os.getenv(name, "")
+    if not raw.strip():
+        return default
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ImproperlyConfigured(f"{name} doit contenir un JSON valide.") from exc
 
 # -----------------------------------------------------------------------------
 # Sécurité / Debug / Hosts
@@ -59,6 +71,8 @@ INSTALLED_APPS = [
     "dashboard",
     "data_api",
     "admin_core",
+    "workflow_core",
+    "import_core",
 ]
 
 # -----------------------------------------------------------------------------
@@ -162,6 +176,26 @@ REST_FRAMEWORK = {
     ],
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
     "PAGE_SIZE": int(os.getenv("DJANGO_PAGE_SIZE", "50")),
+    "DEFAULT_THROTTLE_CLASSES": (
+        "rest_framework.throttling.AnonRateThrottle",
+        "rest_framework.throttling.UserRateThrottle",
+        "rest_framework.throttling.ScopedRateThrottle",
+    ),
+    "DEFAULT_THROTTLE_RATES": {
+        "anon": os.getenv("DRF_THROTTLE_ANON", "60/min"),
+        "user": os.getenv("DRF_THROTTLE_USER", "300/min"),
+        "auth": os.getenv("DRF_THROTTLE_AUTH", "10/min"),
+        "auth_identifier": os.getenv("DRF_THROTTLE_AUTH_IDENTIFIER", "15/min"),
+        "token_refresh": os.getenv("DRF_THROTTLE_TOKEN_REFRESH", "20/min"),
+        "stats": os.getenv("DRF_THROTTLE_STATS", "90/min"),
+        "geojson": os.getenv("DRF_THROTTLE_GEOJSON", "120/min"),
+        "admin_read": os.getenv("DRF_THROTTLE_ADMIN_READ", "120/min"),
+        "admin_write": os.getenv("DRF_THROTTLE_ADMIN_WRITE", "40/min"),
+        "workflow_read": os.getenv("DRF_THROTTLE_WORKFLOW_READ", "180/min"),
+        "workflow_write": os.getenv("DRF_THROTTLE_WORKFLOW_WRITE", "60/min"),
+        "import_read": os.getenv("DRF_THROTTLE_IMPORT_READ", "120/min"),
+        "import_write": os.getenv("DRF_THROTTLE_IMPORT_WRITE", "40/min"),
+    },
 }
 
 SPECTACULAR_SETTINGS = {
@@ -204,6 +238,86 @@ CSRF_TRUSTED_ORIGINS = env_list(
     "DJANGO_CSRF_TRUSTED_ORIGINS",
     "http://localhost:3000,http://localhost:8000"
 )
+
+# -----------------------------------------------------------------------------
+# Security hardening
+# -----------------------------------------------------------------------------
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+SESSION_COOKIE_HTTPONLY = True
+CSRF_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = os.getenv("DJANGO_SESSION_COOKIE_SAMESITE", "Lax")
+CSRF_COOKIE_SAMESITE = os.getenv("DJANGO_CSRF_COOKIE_SAMESITE", "Lax")
+SESSION_COOKIE_SECURE = env_bool("DJANGO_SESSION_COOKIE_SECURE", not DEBUG)
+CSRF_COOKIE_SECURE = env_bool("DJANGO_CSRF_COOKIE_SECURE", not DEBUG)
+
+SECURE_CONTENT_TYPE_NOSNIFF = True
+X_FRAME_OPTIONS = "DENY"
+REFERRER_POLICY = os.getenv("DJANGO_REFERRER_POLICY", "strict-origin-when-cross-origin")
+
+# -----------------------------------------------------------------------------
+# Kobo direct sync (workflow)
+# -----------------------------------------------------------------------------
+KOBO_SYNC_ENABLED = env_bool("KOBO_SYNC_ENABLED", False)
+KOBO_BASE_URL = os.getenv("KOBO_BASE_URL", "https://kf.kobotoolbox.org").rstrip("/")
+KOBO_API_TOKEN = os.getenv("KOBO_API_TOKEN", "").strip()
+KOBO_HTTP_TIMEOUT = int(os.getenv("KOBO_HTTP_TIMEOUT", "20"))
+KOBO_SYNC_MAX_RECORDS = int(os.getenv("KOBO_SYNC_MAX_RECORDS", "500"))
+KOBO_SYNC_MAX_PAYLOAD_RECORDS = int(os.getenv("KOBO_SYNC_MAX_PAYLOAD_RECORDS", "200"))
+KOBO_FORM_REGISTRY = env_json("KOBO_FORM_REGISTRY", {})
+
+# Keep redirect opt-in via env because some deployments are still HTTP-only.
+SECURE_SSL_REDIRECT = env_bool("DJANGO_SECURE_SSL_REDIRECT", False)
+SECURE_HSTS_SECONDS = int(os.getenv("DJANGO_SECURE_HSTS_SECONDS", "31536000" if not DEBUG else "0"))
+SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool("DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS", not DEBUG)
+SECURE_HSTS_PRELOAD = env_bool("DJANGO_SECURE_HSTS_PRELOAD", False)
+
+
+def validate_production_security() -> None:
+    """
+    Fail-fast en production pour eviter les deploiements dangereux.
+    """
+    if DEBUG:
+        return
+
+    # Secrets obligatoires (pas de placeholders).
+    weak_secret_values = {"change-me-in-env", "CHANGE_ME_DJANGO_SECRET_KEY"}
+    if not SECRET_KEY or SECRET_KEY in weak_secret_values or SECRET_KEY.startswith("CHANGE_ME"):
+        raise ImproperlyConfigured("DJANGO_SECRET_KEY invalide pour la production.")
+
+    db_password = os.getenv("DB_PASSWORD", "")
+    if not db_password or db_password.startswith("CHANGE_ME"):
+        raise ImproperlyConfigured("DB_PASSWORD invalide pour la production.")
+
+    if KOBO_SYNC_ENABLED and (not KOBO_API_TOKEN or KOBO_API_TOKEN.startswith("CHANGE_ME")):
+        raise ImproperlyConfigured("KOBO_API_TOKEN invalide pour la production quand KOBO_SYNC_ENABLED=1.")
+
+    # Cookies transportes uniquement en HTTPS.
+    if not SESSION_COOKIE_SECURE or not CSRF_COOKIE_SECURE:
+        raise ImproperlyConfigured("SESSION/CSRF cookies doivent etre secure en production.")
+
+    # HTTPS obligatoire.
+    if not SECURE_SSL_REDIRECT:
+        raise ImproperlyConfigured("DJANGO_SECURE_SSL_REDIRECT doit etre active en production.")
+
+    # CORS/CSRF stricts.
+    if CORS_ALLOW_ALL_ORIGINS:
+        raise ImproperlyConfigured("DJANGO_CORS_ALLOW_ALL_ORIGINS=1 est interdit en production.")
+
+    invalid_csrf_origins = [o for o in CSRF_TRUSTED_ORIGINS if not o.lower().startswith("https://")]
+    if invalid_csrf_origins:
+        raise ImproperlyConfigured(
+            f"CSRF_TRUSTED_ORIGINS doit utiliser HTTPS en production: {invalid_csrf_origins}"
+        )
+
+    invalid_cors_origins = [o for o in CORS_ALLOWED_ORIGINS if not o.lower().startswith("https://")]
+    if invalid_cors_origins:
+        raise ImproperlyConfigured(
+            f"CORS_ALLOWED_ORIGINS doit utiliser HTTPS en production: {invalid_cors_origins}"
+        )
+
+
+validate_production_security()
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
