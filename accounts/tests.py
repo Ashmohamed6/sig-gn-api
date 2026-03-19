@@ -1,10 +1,11 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from django.contrib.auth import get_user_model
 from django.test import SimpleTestCase
 from rest_framework.test import APIRequestFactory
 
-from .serializers import EmailOrUsernameTokenObtainPairSerializer
+from .serializers import EmailOrUsernameTokenObtainPairSerializer, ChangeOwnPasswordSerializer
 from .throttles import AuthIdentifierRateThrottle
 from .views import EmailOrUsernameTokenView, LoginView
 
@@ -80,3 +81,51 @@ class TokenSerializerTests(SimpleTestCase):
                 result = serializer.validate(attrs)
 
         self.assertEqual(result["username"], "missing@example.com")
+
+
+class ChangeOwnPasswordSerializerTests(SimpleTestCase):
+    def setUp(self):
+        self.user_model = get_user_model()
+        self.user = self.user_model(
+            username="profile-user",
+            email="profile@example.com",
+        )
+        self.user.set_password("OldPass123!")
+
+    def test_rejects_invalid_current_password(self):
+        serializer = ChangeOwnPasswordSerializer(
+            data={
+                "current_password": "BadPass123!",
+                "new_password": "NewPass456!@#",
+                "new_password_confirm": "NewPass456!@#",
+            },
+            context={"user": self.user},
+        )
+
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("current_password", serializer.errors)
+
+    def test_rejects_same_password_as_current(self):
+        serializer = ChangeOwnPasswordSerializer(
+            data={
+                "current_password": "OldPass123!",
+                "new_password": "OldPass123!",
+                "new_password_confirm": "OldPass123!",
+            },
+            context={"user": self.user},
+        )
+
+        self.assertFalse(serializer.is_valid())
+        self.assertIn("new_password", serializer.errors)
+
+    def test_accepts_valid_payload(self):
+        serializer = ChangeOwnPasswordSerializer(
+            data={
+                "current_password": "OldPass123!",
+                "new_password": "NewPass456!@#",
+                "new_password_confirm": "NewPass456!@#",
+            },
+            context={"user": self.user},
+        )
+
+        self.assertTrue(serializer.is_valid(), serializer.errors)

@@ -10,6 +10,8 @@ from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from .throttles import AuthIdentifierRateThrottle
 from .serializers import (
     CurrentUserSerializer,
+    CurrentUserUpdateSerializer,
+    ChangeOwnPasswordSerializer,
     RefProjectSerializer,
     SignupSerializer,
     LoginSerializer,
@@ -118,6 +120,36 @@ class MeView(APIView):
     def get(self, request):
         serializer = CurrentUserSerializer(request.user)
         return Response(serializer.data)
+
+    def patch(self, request):
+        serializer = CurrentUserUpdateSerializer(
+            request.user,
+            data=request.data,
+            partial=True,
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+
+        output = CurrentUserSerializer(request.user)
+        return Response(output.data)
+
+
+class MePasswordView(APIView):
+    permission_classes = [IsAuthenticated]
+    serializer_class = ChangeOwnPasswordSerializer
+    throttle_scope = "auth"
+
+    def post(self, request):
+        serializer = ChangeOwnPasswordSerializer(
+            data=request.data,
+            context={"user": request.user},
+        )
+        serializer.is_valid(raise_exception=True)
+
+        request.user.set_password(serializer.validated_data["new_password"])
+        request.user.save(update_fields=["password"])
+
+        return Response({"detail": "Mot de passe modifie avec succes."}, status=status.HTTP_200_OK)
 
 
 class CurrentProjectView(APIView):

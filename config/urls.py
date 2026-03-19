@@ -22,6 +22,7 @@ urlpatterns = [
     path("api/admin/", include("admin_core.urls")),
     path("api/workflow/", include("workflow_core.urls")),
     path("api/import/", include("import_core.urls")),
+    path("api/archive/", include("archive_core.urls")),
 ]
 
 

@@ -73,6 +73,7 @@ INSTALLED_APPS = [
     "admin_core",
     "workflow_core",
     "import_core",
+    "archive_core",
 ]
 
 # -----------------------------------------------------------------------------

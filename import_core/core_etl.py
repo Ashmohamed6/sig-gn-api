@@ -57,6 +57,9 @@ def publish_dataset_to_core(
     if code == "agr-intrants-comptoirs" or code == "agr-marches":
         return _publish_intrants_comptoirs(project_code=project_code, region_id=region_id)
 
+    if code == "agr-intrants-distribution":
+        return _publish_intrants_distribution(project_code=project_code, region_id=region_id)
+
     if code == "agr-ouvrages":
         return _publish_ouvrages(project_code=project_code, region_id=region_id)
 
@@ -86,6 +89,12 @@ def publish_dataset_to_core(
 
     if code == "fiere-emploi-insertion":
         return _publish_fiere_emploi_insertion(project_code=project_code, region_id=region_id)
+
+    if code == "fiere-emploi-domaines":
+        return _publish_fiere_emploi_domaines(project_code=project_code, region_id=region_id)
+
+    if code == "fiere-insertion-domaines":
+        return _publish_fiere_insertion_domaines(project_code=project_code, region_id=region_id)
 
     if code == "fiere-participation":
         return _publish_fiere_participation(project_code=project_code, region_id=region_id)
@@ -567,6 +576,16 @@ def _publish_agr_comites(*, project_code: str, region_id: str | None) -> dict[st
         params,
     )
 
+    delete_by_raw_uuid_sql = f"""
+        DELETE FROM core.agr_comite c
+        USING stage.agr_comite_raw s
+        JOIN ref.admin_commune ac ON ac.id_commune = s.commune
+        WHERE c.raw_uuid = s.raw_uuid
+          AND {where_sql}
+          AND COALESCE(NULLIF(BTRIM(s.id_comite), ''), '') <> ''
+          AND COALESCE(NULLIF(BTRIM(s.commune), ''), '') <> ''
+    """
+
     sql = f"""
         INSERT INTO core.agr_comite (
             raw_uuid,
@@ -702,6 +721,7 @@ def _publish_agr_comites(*, project_code: str, region_id: str | None) -> dict[st
     """
 
     with transaction.atomic():
+        _exec_rowcount(delete_by_raw_uuid_sql, params)
         affected = _exec_rowcount(sql, params)
 
     return {
@@ -1009,6 +1029,94 @@ def _publish_intrants_comptoirs(*, project_code: str, region_id: str | None) -> 
         "core_tables": [
             {"table": "core.intrant_distribution", "affected_rows": intrant_affected},
             {"table": "core.marche", "affected_rows": marche_affected},
+        ],
+    }
+
+
+def _publish_intrants_distribution(*, project_code: str, region_id: str | None) -> dict[str, Any]:
+    filters: list[str] = ["s.project_code = %s"]
+    params: list[Any] = [project_code]
+
+    if region_id:
+        filters.append("ac.id_region = %s")
+        params.append(region_id)
+
+    where_sql = " AND ".join(filters)
+
+    stage_count = _count_scalar(
+        f"""
+        SELECT COUNT(*)
+        FROM stage.intrant_distribution_raw s
+        JOIN ref.admin_commune ac ON ac.id_commune = s.id_commune
+        WHERE {where_sql}
+          AND COALESCE(NULLIF(BTRIM(s.id_commune), ''), '') <> ''
+          AND COALESCE(NULLIF(BTRIM(s.filiere), ''), '') <> ''
+          AND COALESCE(NULLIF(BTRIM(s.type_intrant), ''), '') <> ''
+        """,
+        params,
+    )
+
+    sql = f"""
+        INSERT INTO core.intrant_distribution (
+            raw_uuid,
+            project_code,
+            id_commune,
+            id_prefecture,
+            id_region,
+            geom,
+            filiere,
+            type_intrant,
+            campagne_yyyy,
+            quantite,
+            menages_beneficiaires,
+            valid_from,
+            record_source,
+            updated_at
+        )
+        SELECT
+            s.raw_uuid,
+            s.project_code,
+            s.id_commune,
+            ac.id_prefecture,
+            ac.id_region,
+            s.geom,
+            s.filiere,
+            s.type_intrant,
+            s.campagne_yyyy,
+            s.quantite,
+            s.menages_beneficiaires,
+            COALESCE(s.imported_at::date, CURRENT_DATE),
+            COALESCE(NULLIF(s.import_source, ''), 'admin_csv'),
+            now()
+        FROM stage.intrant_distribution_raw s
+        JOIN ref.admin_commune ac ON ac.id_commune = s.id_commune
+        WHERE {where_sql}
+          AND COALESCE(NULLIF(BTRIM(s.id_commune), ''), '') <> ''
+          AND COALESCE(NULLIF(BTRIM(s.filiere), ''), '') <> ''
+          AND COALESCE(NULLIF(BTRIM(s.type_intrant), ''), '') <> ''
+        ON CONFLICT (raw_uuid) DO UPDATE SET
+            project_code = EXCLUDED.project_code,
+            id_commune = EXCLUDED.id_commune,
+            id_prefecture = EXCLUDED.id_prefecture,
+            id_region = EXCLUDED.id_region,
+            geom = EXCLUDED.geom,
+            filiere = EXCLUDED.filiere,
+            type_intrant = EXCLUDED.type_intrant,
+            campagne_yyyy = EXCLUDED.campagne_yyyy,
+            quantite = EXCLUDED.quantite,
+            menages_beneficiaires = EXCLUDED.menages_beneficiaires,
+            valid_from = EXCLUDED.valid_from,
+            record_source = EXCLUDED.record_source,
+            updated_at = now()
+    """
+
+    with transaction.atomic():
+        affected = _exec_rowcount(sql, params)
+
+    return {
+        "stage_count": stage_count,
+        "core_tables": [
+            {"table": "core.intrant_distribution", "affected_rows": affected},
         ],
     }
 
@@ -1828,6 +1936,16 @@ def _publish_fiere_suivi_sortants(*, project_code: str, region_id: str | None) -
         params,
     )
 
+    delete_by_raw_uuid_sql = f"""
+        DELETE FROM core.fiere_suivi_sortant c
+        USING stage.fiere_suivi_sortant_raw s
+        JOIN ref.admin_commune ac ON ac.id_commune = s.commune
+        WHERE c.raw_uuid = s.raw_uuid
+          AND {where_sql}
+          AND COALESCE(NULLIF(BTRIM(s.id_sortant), ''), '') <> ''
+          AND COALESCE(NULLIF(BTRIM(s.commune), ''), '') <> ''
+    """
+
     sql = f"""
         INSERT INTO core.fiere_suivi_sortant (
             raw_uuid,
@@ -1971,6 +2089,7 @@ def _publish_fiere_suivi_sortants(*, project_code: str, region_id: str | None) -
     """
 
     with transaction.atomic():
+        _exec_rowcount(delete_by_raw_uuid_sql, params)
         affected = _exec_rowcount(sql, params)
 
     return {
@@ -2632,6 +2751,172 @@ def _publish_fiere_emploi_insertion(*, project_code: str, region_id: str | None)
             {"table": "core.ent_insertion", "affected_rows": insertion_affected},
             {"table": "core.ent_emploi_dom", "affected_rows": emploi_dom_affected},
             {"table": "core.ent_insertion_dom", "affected_rows": insertion_dom_affected},
+        ],
+    }
+
+
+def _publish_fiere_emploi_domaines(*, project_code: str, region_id: str | None) -> dict[str, Any]:
+    filters: list[str] = ["e.project_code = %s"]
+    params: list[Any] = [project_code]
+
+    if region_id:
+        filters.append("e.id_region = %s")
+        params.append(region_id)
+
+    where_sql = " AND ".join(filters)
+
+    stage_count = _count_scalar(
+        f"""
+        SELECT COUNT(*)
+        FROM stage.fiere_emploi_dom_raw s
+        JOIN core.ent_emploi e ON e.raw_uuid = s.raw_uuid
+        WHERE {where_sql}
+          AND (
+              COALESCE(NULLIF(BTRIM(s.domaine_emploi), ''), '') <> ''
+              OR COALESCE(NULLIF(BTRIM(s.domaine_emploi_autres), ''), '') <> ''
+          )
+        """,
+        params,
+    )
+
+    delete_sql = f"""
+        DELETE FROM core.ent_emploi_dom d
+        USING core.ent_emploi e
+        WHERE d.emploi_uuid = e.emploi_uuid
+          AND {where_sql}
+    """
+
+    insert_sql = f"""
+        INSERT INTO core.ent_emploi_dom (
+            emploi_uuid,
+            domaine_code,
+            domaine_autre,
+            nb_empl_dom,
+            nb_empl_fem_dom,
+            nb_empl_jeunes_dom,
+            nb_empl_pvh_dom,
+            emploi_vert_dom,
+            valid_from,
+            record_source,
+            updated_at
+        )
+        SELECT DISTINCT
+            e.emploi_uuid,
+            NULLIF(BTRIM(s.domaine_emploi), ''),
+            NULLIF(BTRIM(s.domaine_emploi_autres), ''),
+            s.nb_empl_dom,
+            s.nb_empl_fem_dom,
+            s.nb_empl_jeunes_dom,
+            s.nb_empl_pvh_dom,
+            NULLIF(BTRIM(s.emploi_vert_dom), ''),
+            COALESCE(e.valid_from, CURRENT_DATE),
+            'admin_csv',
+            now()
+        FROM stage.fiere_emploi_dom_raw s
+        JOIN core.ent_emploi e ON e.raw_uuid = s.raw_uuid
+        WHERE {where_sql}
+          AND (
+              COALESCE(NULLIF(BTRIM(s.domaine_emploi), ''), '') <> ''
+              OR COALESCE(NULLIF(BTRIM(s.domaine_emploi_autres), ''), '') <> ''
+          )
+    """
+
+    with transaction.atomic():
+        _exec_rowcount(delete_sql, params)
+        affected = _exec_rowcount(insert_sql, params)
+
+    return {
+        "stage_count": stage_count,
+        "core_tables": [
+            {"table": "core.ent_emploi_dom", "affected_rows": affected},
+        ],
+    }
+
+
+def _publish_fiere_insertion_domaines(*, project_code: str, region_id: str | None) -> dict[str, Any]:
+    filters: list[str] = ["e.project_code = %s"]
+    params: list[Any] = [project_code]
+
+    if region_id:
+        filters.append("e.id_region = %s")
+        params.append(region_id)
+
+    where_sql = " AND ".join(filters)
+
+    stage_count = _count_scalar(
+        f"""
+        SELECT COUNT(*)
+        FROM stage.fiere_insertion_dom_raw s
+        JOIN core.ent_insertion e ON e.raw_uuid = s.raw_uuid
+        WHERE {where_sql}
+          AND (
+              COALESCE(NULLIF(BTRIM(s.domaine_insertion), ''), '') <> ''
+              OR COALESCE(NULLIF(BTRIM(s.domaine_insertion_autres), ''), '') <> ''
+              OR COALESCE(NULLIF(BTRIM(s.type_insertion), ''), '') <> ''
+              OR COALESCE(NULLIF(BTRIM(s.type_insertion_autres), ''), '') <> ''
+          )
+        """,
+        params,
+    )
+
+    delete_sql = f"""
+        DELETE FROM core.ent_insertion_dom d
+        USING core.ent_insertion e
+        WHERE d.insertion_uuid = e.insertion_uuid
+          AND {where_sql}
+    """
+
+    insert_sql = f"""
+        INSERT INTO core.ent_insertion_dom (
+            insertion_uuid,
+            domaine_code,
+            domaine_autre,
+            type_insertion_code,
+            type_insertion_autres,
+            nb_ins_dom,
+            nb_ins_fem_dom,
+            nb_ins_jeunes_dom,
+            duree_insertion_mois,
+            nb_ins_pvh_dom,
+            insertion_verte_dom,
+            valid_from,
+            record_source,
+            updated_at
+        )
+        SELECT DISTINCT
+            e.insertion_uuid,
+            NULLIF(BTRIM(s.domaine_insertion), ''),
+            NULLIF(BTRIM(s.domaine_insertion_autres), ''),
+            NULLIF(BTRIM(s.type_insertion), ''),
+            NULLIF(BTRIM(s.type_insertion_autres), ''),
+            s.nb_ins_dom,
+            s.nb_ins_fem_dom,
+            s.nb_ins_jeunes_dom,
+            s.duree_insertion_mois,
+            s.nb_ins_pvh_dom,
+            NULLIF(BTRIM(s.insertion_verte_dom), ''),
+            COALESCE(e.valid_from, CURRENT_DATE),
+            'admin_csv',
+            now()
+        FROM stage.fiere_insertion_dom_raw s
+        JOIN core.ent_insertion e ON e.raw_uuid = s.raw_uuid
+        WHERE {where_sql}
+          AND (
+              COALESCE(NULLIF(BTRIM(s.domaine_insertion), ''), '') <> ''
+              OR COALESCE(NULLIF(BTRIM(s.domaine_insertion_autres), ''), '') <> ''
+              OR COALESCE(NULLIF(BTRIM(s.type_insertion), ''), '') <> ''
+              OR COALESCE(NULLIF(BTRIM(s.type_insertion_autres), ''), '') <> ''
+          )
+    """
+
+    with transaction.atomic():
+        _exec_rowcount(delete_sql, params)
+        affected = _exec_rowcount(insert_sql, params)
+
+    return {
+        "stage_count": stage_count,
+        "core_tables": [
+            {"table": "core.ent_insertion_dom", "affected_rows": affected},
         ],
     }
 

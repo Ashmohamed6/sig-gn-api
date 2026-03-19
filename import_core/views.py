@@ -13,6 +13,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from accounts.models import RefProject
+from archive_core.collectors import capture_archive_snapshots_for_publication
 from data_api.mixins import CurrentProjectRequiredMixin
 
 from .csv_parser import CsvParserError, parse_csv_upload, sample_rows
@@ -24,6 +25,7 @@ from .etl import (
     find_potential_existing_identifiers,
     get_stage_columns,
     list_datasets_for_project,
+    prepare_records_for_stage,
     resolve_dataset_definition,
 )
 from .models import ImportLog
@@ -300,10 +302,15 @@ class ImportValidateView(ImportBaseView):
 
         try:
             stage_columns = get_stage_columns(dataset.stage_table)
+            prepared_records, _, _ = prepare_records_for_stage(
+                parse_result.records,
+                stage_columns,
+                identifier_fields=getattr(dataset, "identifier_fields", ()),
+            )
             existing_identifiers = find_potential_existing_identifiers(
                 dataset=dataset,
                 stage_columns=stage_columns,
-                records=parse_result.records,
+                records=prepared_records,
                 project_code=scope.project_code,
             )
             report = build_validation_report(
@@ -354,12 +361,26 @@ class ImportExecuteView(ImportBaseView):
             stage_columns = get_stage_columns(dataset.stage_table)
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        prepared_records, _, _ = prepare_records_for_stage(
+            parse_result.records,
+            stage_columns,
+            identifier_fields=getattr(dataset, "identifier_fields", ()),
+        )
+        existing_identifiers: set[str] = set()
+        if getattr(dataset, "identifier_fields", None):
+            existing_identifiers = find_potential_existing_identifiers(
+                dataset=dataset,
+                stage_columns=stage_columns,
+                records=prepared_records,
+                project_code=scope.project_code,
+            )
         validation = build_validation_report(
             parse_result=parse_result,
             dataset=dataset,
             stage_columns=stage_columns,
             project_code=scope.project_code,
             region_id=scope.region_id,
+            existing_identifiers=existing_identifiers,
         )
 
         import_uuid = uuid.uuid4()
@@ -516,11 +537,29 @@ class ImportPublishView(ImportBaseView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
+        archive_capture: dict[str, Any]
+        try:
+            archive_capture = capture_archive_snapshots_for_publication(
+                project_code=scope.project_code,
+                region_id=scope.region_id,
+                dataset_code=dataset.code,
+                captured_by=request.user,
+            )
+        except Exception as exc:
+            archive_capture = {
+                "executed": True,
+                "status": "failed",
+                "error": str(exc),
+                "captured_metrics": [],
+                "created": 0,
+                "updated": 0,
+            }
+
         finalize_etl_run_entry(
             run_id=run_id,
             status_text="success",
             errors_cnt=0,
-            message=_json_dump(publish_result),
+            message=_json_dump({**publish_result, "archive_capture": archive_capture}),
         )
 
         return Response(
@@ -531,6 +570,7 @@ class ImportPublishView(ImportBaseView):
                 "project_code": scope.project_code,
                 "region_id": scope.region_id,
                 **publish_result,
+                "archive_capture": archive_capture,
             },
             status=status.HTTP_200_OK,
         )

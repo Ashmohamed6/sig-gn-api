@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import uuid
@@ -95,7 +96,7 @@ DATASET_DEFINITIONS: tuple[DatasetDefinition, ...] = (
         stage_table="intrant_distribution_raw",
         project_codes=("AGRIECO",),
         aliases=("distribution-intrants",),
-        identifier_fields=("id_kit", "id_beneficiaire"),
+        identifier_fields=("id_intrant", "raw_uuid"),
     ),
     DatasetDefinition(
         code="agr-ouvrages",
@@ -183,7 +184,7 @@ DATASET_DEFINITIONS: tuple[DatasetDefinition, ...] = (
         stage_table="fiere_emploi_dom_raw",
         project_codes=("FIERE",),
         aliases=("fiere-emploi-dom",),
-        identifier_fields=("emploi_uuid", "domaine_code"),
+        identifier_fields=("raw_uuid", "domaine_emploi"),
     ),
     DatasetDefinition(
         code="fiere-insertion-domaines",
@@ -191,7 +192,7 @@ DATASET_DEFINITIONS: tuple[DatasetDefinition, ...] = (
         stage_table="fiere_insertion_dom_raw",
         project_codes=("FIERE",),
         aliases=("fiere-insertion-dom",),
-        identifier_fields=("insertion_uuid", "domaine_code"),
+        identifier_fields=("raw_uuid", "domaine_insertion"),
     ),
     DatasetDefinition(
         code="fiere-participation",
@@ -220,6 +221,19 @@ _KOBO_META_COLUMNS = frozenset({
     # csv_parser.normalize_header_name() -> _uuid becomes uuid, etc.
     "id", "uuid", "submission_time", "validation_status",
     "notes", "status", "submitted_by", "version", "tags", "index",
+    "meta_rootuuid",
+})
+
+_PAYLOAD_ONLY_DATA_COLUMNS = frozenset({
+    # These fields are present in some Kobo exports but have no dedicated stage column.
+    # They are preserved inside raw_payload.
+    "couloir_present",
+    "photo_station",
+    "photo_station_url",
+    "photo_source",
+    "photo_source_url",
+    "photo_restaur",
+    "photo_restaur_url",
 })
 
 
@@ -229,6 +243,330 @@ def categorize_column(column_name: str) -> str:
     if column_name in _KOBO_META_COLUMNS:
         return "kobo_meta"
     return "data"
+
+
+_CHECKBOX_TRUE_VALUES = frozenset({"1", "true", "t", "yes", "y", "oui", "vrai", "x"})
+_CHECKBOX_FALSE_VALUES = frozenset({"0", "false", "f", "no", "n", "non", "faux"})
+_AUTO_IDENTIFIER_EXPLICIT_FIELDS = frozenset({"code_station", "code_ouvrage"})
+_AUTO_IDENTIFIER_SEED_FIELDS = (
+    "raw_uuid",
+    "uuid",
+    "meta_rootuuid",
+    "submission_uuid",
+    "id",
+    "index",
+    "submission_time",
+    "start",
+    "today",
+    "deviceid",
+    "username",
+    "nom_comite",
+    "commune",
+    "localite",
+    "id_ent",
+    "nom_acteur",
+    "id_couloir",
+    "id_org",
+    "id_menage",
+)
+
+
+def _parse_checkbox_token(value: Any) -> bool | None:
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    if text in _CHECKBOX_TRUE_VALUES:
+        return True
+    if text in _CHECKBOX_FALSE_VALUES:
+        return False
+    return None
+
+
+def _normalize_identifier_seed(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.lower().startswith("uuid:"):
+        text = text[5:].strip()
+    return text
+
+
+def _is_auto_identifier_field(field_name: str) -> bool:
+    name = str(field_name or "").strip().lower()
+    if not name:
+        return False
+    if name in _AUTO_IDENTIFIER_EXPLICIT_FIELDS:
+        return True
+    return (
+        name == "id"
+        or name.startswith("id_")
+        or name.endswith("_id")
+        or "uuid" in name
+    )
+
+
+def _generate_auto_identifier(
+    field_name: str,
+    column: StageColumn,
+    row: dict[str, str],
+    row_number: int,
+    *,
+    suffix: int = 0,
+) -> str:
+    seed_parts: list[str] = []
+    seed_parts.append(f"field={field_name}")
+    for field in _AUTO_IDENTIFIER_SEED_FIELDS:
+        value = _normalize_identifier_seed(row.get(field))
+        if value:
+            seed_parts.append(f"{field}={value}")
+
+    if len(seed_parts) == 1:
+        # Last-resort deterministic seed within the file payload.
+        seed_parts.append(f"row_number={row_number}")
+    if suffix:
+        seed_parts.append(f"suffix={suffix}")
+
+    seed_text = "|".join(seed_parts)
+    if column.udt_name == "uuid":
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, seed_text))
+
+    digest = hashlib.sha1(seed_text.encode("utf-8")).hexdigest()
+    if column.udt_name in {"int2", "int4", "int8"}:
+        # Keep positive deterministic integers for numeric identifiers.
+        if column.udt_name == "int2":
+            max_value = 32767
+        elif column.udt_name == "int4":
+            max_value = 2147483647
+        else:
+            max_value = 9223372036854775807
+        value = (int(digest[:16], 16) % (max_value - 1)) + 1
+        return str(value)
+
+    if field_name == "id_comite":
+        prefix = "AUTO-COMITE"
+    else:
+        cleaned = re.sub(r"[^A-Z0-9]+", "-", field_name.upper()).strip("-")
+        prefix = f"AUTO-{cleaned or 'ID'}"
+    return f"{prefix}-{digest[:12].upper()}"
+
+
+def _split_codes(value: str | None) -> list[str]:
+    text = str(value or "").strip()
+    if not text:
+        return []
+    parts = [item.strip().upper() for item in re.split(r"[\s,|;]+", text) if item.strip()]
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in parts:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def _build_stage_alias_lookup(stage_column_names: set[str]) -> dict[str, str]:
+    alias_to_target: dict[str, str] = {}
+
+    def register(alias_name: str, target_name: str) -> None:
+        alias = str(alias_name or "").strip()
+        target = str(target_name or "").strip()
+        if not alias or not target:
+            return
+        if target not in stage_column_names:
+            return
+        alias_to_target.setdefault(alias, target)
+
+    for col in sorted(stage_column_names):
+        register(col, col)
+        register(f"{col}_url", col)
+
+        # Singular/plural drift observed in Kobo forms (e.g. theme_comite vs themes_comite).
+        if col.endswith("s") and len(col) > 1:
+            register(col[:-1], col)
+
+        if col.startswith("types_"):
+            register(f"type_{col[6:]}", col)
+        if col.startswith("themes_"):
+            register(f"theme_{col[7:]}", col)
+
+    if "region" in stage_column_names:
+        register("grp_loc_region", "region")
+    if "prefecture" in stage_column_names:
+        register("grp_loc_prefecture", "prefecture")
+    if "localite" in stage_column_names:
+        register("grp_loc_localite", "localite")
+
+    if "commune" in stage_column_names:
+        register("grp_loc_commune", "commune")
+        register("id_commune", "commune")
+    if "id_commune" in stage_column_names:
+        register("commune", "id_commune")
+        register("grp_loc_commune", "id_commune")
+
+    if "code_station" in stage_column_names:
+        register("station_id", "code_station")
+
+    if "geom" in stage_column_names:
+        register("trace_couloir", "geom")
+    if "geom_zone" in stage_column_names:
+        register("zone_geom", "geom_zone")
+
+    return alias_to_target
+
+
+def _infer_checkbox_derivations(
+    records: list[dict[str, str]],
+    stage_column_names: set[str],
+    alias_to_target: dict[str, str],
+) -> dict[str, tuple[str, str]]:
+    if not records:
+        return {}
+
+    headers: set[str] = set()
+    for row in records:
+        headers.update(row.keys())
+
+    # Longest prefixes first to avoid ambiguous matches.
+    candidate_prefixes = sorted(
+        {name for name, target in alias_to_target.items() if target in stage_column_names}
+        | stage_column_names,
+        key=len,
+        reverse=True,
+    )
+
+    out: dict[str, tuple[str, str]] = {}
+    for header in headers:
+        if header in stage_column_names:
+            continue
+
+        target_name = ""
+        source_prefix = ""
+        for prefix in candidate_prefixes:
+            if not header.startswith(prefix + "_"):
+                continue
+            target = alias_to_target.get(prefix, prefix)
+            if target not in stage_column_names:
+                continue
+            target_name = target
+            source_prefix = prefix
+            break
+
+        if not target_name or not source_prefix:
+            continue
+
+        non_empty_values = [str(row.get(header, "")).strip() for row in records if str(row.get(header, "")).strip()]
+        # Restrict derivation to checkbox-like fields (0/1, yes/no, true/false)
+        # when values are present. Fully empty columns are still accepted.
+        if non_empty_values and any(_parse_checkbox_token(value) is None for value in non_empty_values):
+            continue
+
+        out[header] = (target_name, source_prefix)
+
+    return out
+
+
+def prepare_records_for_stage(
+    records: list[dict[str, str]],
+    stage_columns: list[StageColumn],
+    identifier_fields: tuple[str, ...] | None = None,
+) -> tuple[list[dict[str, str]], dict[str, str], dict[str, tuple[str, str]]]:
+    stage_column_names = {col.name for col in stage_columns}
+    stage_columns_by_name = {col.name: col for col in stage_columns}
+    alias_to_target = _build_stage_alias_lookup(stage_column_names)
+    alias_header_map = {
+        header: target
+        for header, target in alias_to_target.items()
+        if header not in stage_column_names and target in stage_column_names
+    }
+    checkbox_header_map = _infer_checkbox_derivations(records, stage_column_names, alias_to_target)
+
+    auto_identifier_fields = tuple(
+        field
+        for field in (identifier_fields or ())
+        if field in stage_column_names and _is_auto_identifier_field(field)
+    )
+    known_identifier_values: dict[str, set[str]] = {field: set() for field in auto_identifier_fields}
+    generated_identifier_values: dict[str, set[str]] = {field: set() for field in auto_identifier_fields}
+    for raw_row in records:
+        for field in auto_identifier_fields:
+            current_value = str(raw_row.get(field, "")).strip()
+            if current_value:
+                known_identifier_values[field].add(current_value)
+
+    prepared_records: list[dict[str, str]] = []
+    for row_number, raw_row in enumerate(records, start=1):
+        row = dict(raw_row)
+
+        # Copy values from known aliases only when canonical target is empty.
+        for source_header, target_header in alias_header_map.items():
+            source_value = str(row.get(source_header, "")).strip()
+            if not source_value:
+                continue
+            if str(row.get(target_header, "")).strip():
+                continue
+            row[target_header] = source_value
+
+        # File attachments often expose a companion *_url field; keep URL when main field is empty.
+        for target_header in stage_column_names:
+            url_header = f"{target_header}_url"
+            if url_header not in row:
+                continue
+            target_value = str(row.get(target_header, "")).strip()
+            url_value = str(row.get(url_header, "")).strip()
+            if not target_value and url_value:
+                row[target_header] = url_value
+
+        selected_codes_by_target: dict[str, list[str]] = {}
+        for source_header, (target_header, source_prefix) in checkbox_header_map.items():
+            token = _parse_checkbox_token(row.get(source_header))
+            if token is not True:
+                continue
+
+            suffix = source_header[len(source_prefix) + 1 :].strip()
+            if not suffix:
+                continue
+            selected_codes_by_target.setdefault(target_header, []).append(suffix.upper())
+
+        for target_header, selected_codes in selected_codes_by_target.items():
+            merged_codes = _split_codes(row.get(target_header))
+            for code in selected_codes:
+                if code not in merged_codes:
+                    merged_codes.append(code)
+            if merged_codes:
+                row[target_header] = " ".join(merged_codes)
+
+        # Kobo forms can produce empty identifiers; generate stable values for all
+        # dataset identifier fields that are id/uuid-like.
+        for field in auto_identifier_fields:
+            current_value = str(row.get(field, "")).strip()
+            if current_value:
+                known_identifier_values[field].add(current_value)
+                continue
+
+            column = stage_columns_by_name[field]
+            candidate_value = _generate_auto_identifier(field, column, row, row_number, suffix=0)
+            if (
+                candidate_value in known_identifier_values[field]
+                and candidate_value not in generated_identifier_values[field]
+            ):
+                suffix = 2
+                while True:
+                    candidate_value = _generate_auto_identifier(field, column, row, row_number, suffix=suffix)
+                    if (
+                        candidate_value not in known_identifier_values[field]
+                        or candidate_value in generated_identifier_values[field]
+                    ):
+                        break
+                    suffix += 1
+
+            row[field] = candidate_value
+            known_identifier_values[field].add(candidate_value)
+            generated_identifier_values[field].add(candidate_value)
+
+        prepared_records.append(row)
+
+    return prepared_records, alias_header_map, checkbox_header_map
 
 
 def normalize_dataset_code(value: str | None) -> str:
@@ -475,6 +813,72 @@ def _build_polygon_wkt(raw: str) -> str | None:
     return f"POLYGON(({coords}))"
 
 
+def _build_polygon_geom_sql(raw_geom: str | None, row: dict[str, str]) -> tuple[str, list[Any]] | None:
+    candidates: list[str] = []
+    raw_text = str(raw_geom or "").strip()
+    if raw_text:
+        candidates.append(raw_text)
+
+    for key in ("zone_geom", "geoshape"):
+        value = str(row.get(key) or "").strip()
+        if value:
+            candidates.append(value)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+
+        upper = candidate.upper()
+        if upper.startswith("SRID="):
+            if "POLYGON" in upper:
+                return "ST_GeomFromEWKT(%s)", [candidate]
+            continue
+
+        if upper.startswith("POLYGON(") or upper.startswith("MULTIPOLYGON("):
+            return "ST_GeomFromText(%s, 4326)", [candidate]
+
+        wkt = _build_polygon_wkt(candidate)
+        if wkt:
+            return "ST_GeomFromText(%s, 4326)", [wkt]
+
+    return None
+
+
+def _build_linestring_geom_sql(raw_geom: str | None, row: dict[str, str]) -> tuple[str, list[Any]] | None:
+    candidates: list[str] = []
+    raw_text = str(raw_geom or "").strip()
+    if raw_text:
+        candidates.append(raw_text)
+
+    for key in ("trace_couloir", "trace", "geotrace"):
+        value = str(row.get(key) or "").strip()
+        if value:
+            candidates.append(value)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+
+        upper = candidate.upper()
+        if upper.startswith("SRID="):
+            if "LINESTRING" in upper:
+                return "ST_GeomFromEWKT(%s)", [candidate]
+            continue
+
+        if upper.startswith("LINESTRING(") or upper.startswith("MULTILINESTRING("):
+            return "ST_GeomFromText(%s, 4326)", [candidate]
+
+        wkt = _build_linestring_wkt(candidate)
+        if wkt:
+            return "ST_GeomFromText(%s, 4326)", [wkt]
+
+    return None
+
+
 def build_geom_sql(raw_geom: str | None, row: dict[str, str]) -> tuple[str, list[Any]] | None:
     geom = str(raw_geom or "").strip()
     if not geom:
@@ -564,8 +968,37 @@ def build_validation_report(
         existing_identifiers = set()
 
     stage_column_names = {col.name for col in stage_columns}
-    recognized = [h for h in parse_result.headers_normalized if h in stage_column_names]
-    unknown = [h for h in parse_result.headers_normalized if h not in stage_column_names]
+    prepared_records, alias_header_map, checkbox_header_map = prepare_records_for_stage(
+        parse_result.records,
+        stage_columns,
+        identifier_fields=getattr(dataset, "identifier_fields", ()),
+    )
+
+    direct_headers = [h for h in parse_result.headers_normalized if h in stage_column_names]
+    alias_headers = [h for h in parse_result.headers_normalized if h in alias_header_map]
+    checkbox_headers = [h for h in parse_result.headers_normalized if h in checkbox_header_map]
+    ignored_kobo_meta_headers = [
+        h for h in parse_result.headers_normalized
+        if h in _KOBO_META_COLUMNS
+        and h not in stage_column_names
+        and h not in alias_header_map
+        and h not in checkbox_header_map
+    ]
+    payload_only_headers = [
+        h for h in parse_result.headers_normalized
+        if h in _PAYLOAD_ONLY_DATA_COLUMNS
+        and h not in stage_column_names
+        and h not in alias_header_map
+        and h not in checkbox_header_map
+    ]
+    unknown = [
+        h for h in parse_result.headers_normalized
+        if h not in stage_column_names
+        and h not in alias_header_map
+        and h not in checkbox_header_map
+        and h not in _KOBO_META_COLUMNS
+        and h not in _PAYLOAD_ONLY_DATA_COLUMNS
+    ]
 
     warnings: list[str] = []
     errors: list[str] = []
@@ -573,29 +1006,53 @@ def build_validation_report(
     if parse_result.row_count == 0:
         errors.append("Le CSV ne contient aucune ligne de donnees.")
 
-    if not recognized:
+    if not direct_headers and not alias_headers and not checkbox_headers:
         errors.append("Aucune colonne CSV ne correspond aux colonnes de la table stage cible.")
 
-    identifier = next((f for f in dataset.identifier_fields if f in parse_result.headers_normalized), None)
+    identifier = next(
+        (
+            field
+            for field in dataset.identifier_fields
+            if field in stage_column_names and any(str(row.get(field, "")).strip() for row in prepared_records)
+        ),
+        None,
+    )
+    if identifier is None:
+        identifier = next(
+            (
+                field
+                for field in dataset.identifier_fields
+                if any(str(row.get(field, "")).strip() for row in prepared_records)
+            ),
+            None,
+        )
     duplicate_identifiers: list[str] = []
     # Classify rows into new / existing / duplicate
     new_rows_list: list[dict[str, str]] = []
     existing_rows_list: list[dict[str, str]] = []
     duplicate_rows_list: list[dict[str, str]] = []
+    missing_identifier_rows_list: list[dict[str, str]] = []
     new_count = 0
     existing_count = 0
     duplicate_count = 0
+    missing_identifier_count = 0
+    auto_generated_identifier_count = 0
 
     if identifier:
+        for raw_row, prepared_row in zip(parse_result.records, prepared_records):
+            raw_value = str(raw_row.get(identifier, "")).strip()
+            prepared_value = str(prepared_row.get(identifier, "")).strip()
+            if not raw_value and prepared_value:
+                auto_generated_identifier_count += 1
+
         seen: set[str] = set()
         duplicates: set[str] = set()
-        for row in parse_result.records:
+        for row in prepared_records:
             value = str(row.get(identifier, "")).strip()
             if not value:
-                # Rows without identifier value count as new
-                new_count += 1
-                if len(new_rows_list) < 50:
-                    new_rows_list.append(row)
+                missing_identifier_count += 1
+                if len(missing_identifier_rows_list) < 50:
+                    missing_identifier_rows_list.append(row)
                 continue
             if value in seen:
                 # Duplicate within the file (2nd+ occurrence)
@@ -617,15 +1074,23 @@ def build_validation_report(
             warnings.append(
                 f"Doublons detectes sur '{identifier}' dans le fichier: {len(duplicate_identifiers)} valeur(s)."
             )
+        if missing_identifier_count:
+            warnings.append(
+                f"{missing_identifier_count} ligne(s) sans '{identifier}' ne seront pas comptabilisees comme nouvelles."
+            )
+        if auto_generated_identifier_count:
+            warnings.append(
+                f"{auto_generated_identifier_count} ligne(s) sans '{identifier}' ont recu un identifiant auto-genere."
+            )
     else:
         warnings.append("Aucune colonne identifiant connue detectee pour ce dataset.")
         # Without identifier, all rows are considered new
         new_count = parse_result.row_count
-        new_rows_list = parse_result.records[:50]
+        new_rows_list = prepared_records[:50]
 
     invalid_geom_rows = 0
     if "geom" in stage_column_names:
-        for row in parse_result.records:
+        for row in prepared_records:
             raw_geom = row.get("geom")
             has_any_geo_hint = bool(
                 str(raw_geom or "").strip()
@@ -638,11 +1103,33 @@ def build_validation_report(
                 or str(row.get("gps_point_latitude") or "").strip()
                 or str(row.get("gps_point_longitude") or "").strip()
             )
-            if has_any_geo_hint and build_geom_sql(raw_geom, row) is None:
+            if dataset.code == "agr-couloirs":
+                geom_sql = _build_linestring_geom_sql(raw_geom, row)
+            elif dataset.code == "agr-zones-degradees" and "geom_zone" in stage_column_names:
+                geom_sql = _build_polygon_geom_sql(row.get("geom_zone"), row)
+            else:
+                geom_sql = build_geom_sql(raw_geom, row)
+            if has_any_geo_hint and geom_sql is None:
                 invalid_geom_rows += 1
 
     if invalid_geom_rows:
         warnings.append(f"Geometrie non interpretable sur {invalid_geom_rows} ligne(s).")
+
+    if checkbox_headers:
+        mapped_targets = sorted({checkbox_header_map[h][0] for h in checkbox_headers})
+        warnings.append(
+            f"{len(checkbox_headers)} colonne(s) checkbox Kobo mappees automatiquement vers {len(mapped_targets)} champ(s)."
+        )
+
+    if ignored_kobo_meta_headers:
+        warnings.append(
+            f"{len(ignored_kobo_meta_headers)} metadonnee(s) Kobo seront conservees dans raw_payload."
+        )
+
+    if payload_only_headers:
+        warnings.append(
+            f"{len(payload_only_headers)} colonne(s) metier sans colonne stage seront conservees dans raw_payload."
+        )
 
     if unknown:
         warnings.append(f"{len(unknown)} colonne(s) non reconnue(s) seront ignorees.")
@@ -655,14 +1142,55 @@ def build_validation_report(
     csv_header_set = set(parse_result.headers_normalized)
     column_mapping: list[dict[str, Any]] = []
 
-    # Matched columns: CSV header exists in stage schema
+    recognized_stage_columns: list[str] = []
+    seen_stage_columns: set[str] = set()
+
     for header in parse_result.headers_normalized:
         if header in stage_column_names:
+            if header not in seen_stage_columns:
+                recognized_stage_columns.append(header)
+                seen_stage_columns.add(header)
             column_mapping.append({
                 "csv_header": header,
                 "stage_column": header,
                 "status": "matched",
                 "category": categorize_column(header),
+            })
+        elif header in alias_header_map:
+            target = alias_header_map[header]
+            if target not in seen_stage_columns:
+                recognized_stage_columns.append(target)
+                seen_stage_columns.add(target)
+            column_mapping.append({
+                "csv_header": header,
+                "stage_column": target,
+                "status": "alias_mapped",
+                "category": categorize_column(target),
+            })
+        elif header in checkbox_header_map:
+            target = checkbox_header_map[header][0]
+            if target not in seen_stage_columns:
+                recognized_stage_columns.append(target)
+                seen_stage_columns.add(target)
+            column_mapping.append({
+                "csv_header": header,
+                "stage_column": target,
+                "status": "derived_checkbox",
+                "category": categorize_column(target),
+            })
+        elif header in _KOBO_META_COLUMNS:
+            column_mapping.append({
+                "csv_header": header,
+                "stage_column": None,
+                "status": "ignored_kobo_meta",
+                "category": "kobo_meta",
+            })
+        elif header in _PAYLOAD_ONLY_DATA_COLUMNS:
+            column_mapping.append({
+                "csv_header": header,
+                "stage_column": None,
+                "status": "ignored_payload_only",
+                "category": "data",
             })
         else:
             column_mapping.append({
@@ -697,7 +1225,7 @@ def build_validation_report(
         "stats": {
             "rows_total": parse_result.row_count,
             "columns_total": len(parse_result.headers_normalized),
-            "columns_recognized": len(recognized),
+            "columns_recognized": len(direct_headers) + len(alias_headers) + len(checkbox_headers),
             "columns_unknown": len(unknown),
             "duplicate_identifier_count": len(duplicate_identifiers),
             "potential_existing_count": potential_existing_count,
@@ -705,10 +1233,12 @@ def build_validation_report(
             "new_count": new_count,
             "existing_count": existing_count,
             "duplicate_count": duplicate_count,
+            "missing_identifier_count": missing_identifier_count,
+            "auto_generated_identifier_count": auto_generated_identifier_count,
         },
         "columns": {
             "expected": [col.name for col in stage_columns],
-            "recognized": recognized,
+            "recognized": recognized_stage_columns,
             "unknown": unknown,
         },
         "column_mapping": column_mapping,
@@ -716,6 +1246,7 @@ def build_validation_report(
         "new_rows": new_rows_list,
         "existing_rows": existing_rows_list,
         "duplicate_rows": duplicate_rows_list,
+        "missing_identifier_rows": missing_identifier_rows_list,
         "warnings": warnings,
         "errors": errors,
     }
@@ -735,7 +1266,11 @@ def execute_import_into_stage(
     pk_column_set = set(pk_columns)
     stage_column_names = {col.name for col in stage_columns}
 
-    records = parse_result.records
+    records, _, _ = prepare_records_for_stage(
+        parse_result.records,
+        stage_columns,
+        identifier_fields=getattr(dataset, "identifier_fields", ()),
+    )
 
     if on_duplicate == "update_only":
         # Filter records to keep only those whose identifier exists in stage
@@ -758,9 +1293,40 @@ def execute_import_into_stage(
             records = []
         # update_only uses the same SQL as "update" (ON CONFLICT DO UPDATE)
         on_duplicate = "update"
+    elif on_duplicate == "skip":
+        # "Skip" mode is used by the UI action "Importer nouvelles lignes":
+        # keep only non-existing identifiers (and first occurrence in file).
+        existing_ids = find_potential_existing_identifiers(
+            dataset=dataset,
+            stage_columns=stage_columns,
+            records=records,
+            project_code=project_code,
+        )
+        identifier = next(
+            (field for field in dataset.identifier_fields if field in stage_column_names),
+            None,
+        )
+        if identifier:
+            seen_identifiers: set[str] = set()
+            filtered_records: list[dict[str, str]] = []
+            for row in records:
+                value = str(row.get(identifier, "")).strip()
+                if not value:
+                    continue
+                if value in seen_identifiers:
+                    continue
+                seen_identifiers.add(value)
+                if value in existing_ids:
+                    continue
+                filtered_records.append(row)
+            records = filtered_records
+            # Keep "new lines only" semantics, but still upsert on PK conflicts
+            # (ex: same raw_uuid already staged with empty identifier).
+            on_duplicate = "update"
 
     rows_total = len(records)
     rows_ok = 0
+    rows_skipped = 0
     row_errors: list[dict[str, Any]] = []
 
     insert_sql_template_prefix = f"INSERT INTO stage.{_quote_ident(dataset.stage_table)}"
@@ -787,7 +1353,14 @@ def execute_import_into_stage(
                     elif col_name == "raw_uuid":
                         if not has_row_value:
                             # Kobo exports typically provide `_uuid` (normalized to `uuid`).
-                            for candidate in ("raw_uuid", "uuid", "_uuid", "meta_instanceid", "meta_instance_id"):
+                            for candidate in (
+                                "raw_uuid",
+                                "uuid",
+                                "_uuid",
+                                "meta_rootuuid",
+                                "meta_instanceid",
+                                "meta_instance_id",
+                            ):
                                 candidate_value = str(raw_row.get(candidate, "")).strip()
                                 if candidate_value:
                                     value = candidate_value
@@ -841,18 +1414,23 @@ def execute_import_into_stage(
 
                         # 1) Dataset-specific handling for Kobo geoshape/geotrace strings.
                         if col_name == "geom_zone":
-                            shape_raw = str(value or "").strip() or str(raw_row.get("zone_geom") or "").strip()
-                            wkt = _build_polygon_wkt(shape_raw) if shape_raw else None
-                            if wkt:
-                                geom_sql = ("ST_GeomFromText(%s, 4326)", [wkt])
+                            geom_sql = _build_polygon_geom_sql(value, raw_row)
                         elif col_name == "geom":
-                            trace_raw = str(raw_row.get("trace_couloir") or "").strip()
-                            wkt = _build_linestring_wkt(trace_raw) if trace_raw else None
-                            if wkt:
-                                geom_sql = ("ST_GeomFromText(%s, 4326)", [wkt])
+                            if dataset.code == "agr-couloirs":
+                                # Couloirs require LINESTRING geometry.
+                                geom_sql = _build_linestring_geom_sql(value, raw_row)
+                            else:
+                                trace_raw = str(raw_row.get("trace_couloir") or "").strip()
+                                wkt = _build_linestring_wkt(trace_raw) if trace_raw else None
+                                if wkt:
+                                    geom_sql = ("ST_GeomFromText(%s, 4326)", [wkt])
 
                         # 2) Generic handling (WKT / EWKT / gps_point / lat+lon).
-                        if geom_sql is None:
+                        # For couloirs/zones, avoid generic POINT fallback on line/polygon targets.
+                        if geom_sql is None and not (
+                            (dataset.code == "agr-couloirs" and col_name == "geom")
+                            or (dataset.code == "agr-zones-degradees" and col_name == "geom_zone")
+                        ):
                             geom_sql = build_geom_sql(str(value or ""), raw_row)
 
                         if geom_sql is None:
@@ -900,7 +1478,10 @@ def execute_import_into_stage(
                             sql += f" ON CONFLICT ({conflict_target}) DO NOTHING"
 
                 cursor.execute(sql, params)
-                rows_ok += 1
+                if int(cursor.rowcount or 0) == 0:
+                    rows_skipped += 1
+                else:
+                    rows_ok += 1
             except Exception as exc:
                 row_errors.append(
                     {
@@ -909,11 +1490,12 @@ def execute_import_into_stage(
                     }
                 )
 
-    rows_error = rows_total - rows_ok
+    rows_error = len(row_errors)
     return {
         "stage_table": f"stage.{dataset.stage_table}",
         "rows_total": rows_total,
         "rows_ok": rows_ok,
+        "rows_skipped": rows_skipped,
         "rows_error": rows_error,
         "errors": row_errors[:200],
     }

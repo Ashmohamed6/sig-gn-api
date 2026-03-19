@@ -2,6 +2,7 @@ from django.urls import path
 
 from .views import (
     MeView,
+    MePasswordView,
     CurrentProjectView,
     LoginView,
     SignupView,
@@ -22,5 +23,6 @@ urlpatterns = [
 
     # --- User courant & projet actif ---
     path("me/", MeView.as_view(), name="accounts_me"),
+    path("me/password/", MePasswordView.as_view(), name="accounts_me_password"),
     path("current-project/", CurrentProjectView.as_view(), name="accounts_current_project"),
 ]
